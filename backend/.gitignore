@@ -1,0 +1,38 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyc
+.ipynb_checkpoints/
+
+# Secrets — use .env.example as template
+.env
+
+# Startup scripts with real credentials — use start-backend.example.ps1
+start-backend.ps1
+
+# Database files
+*.db
+*.sqlite
+.webui_secret_key
+
+# Uploaded user files (runtime data)
+uploads/
+_old/
+_test/
+
+# Data directories (runtime generated)
+/data/*
+/futureverse_ai/data/*
+!/data/litellm/
+/data/litellm/*
+!data/litellm/config.yaml
+!data/config.json
+
+# Vector DB local storage
+qdrant_storage/
+
+# Logs
+*.log
+
+# Misc
+Pipfile

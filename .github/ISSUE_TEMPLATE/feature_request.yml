@@ -1,0 +1,39 @@
+name: Feature Request
+description: Propose a new feature
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Auth / Login
+        - Chat / Messaging
+        - Knowledge / RAG
+        - Knowledge Graph (Neo4j)
+        - Vector Search (Qdrant/Weaviate)
+        - Models / LLM
+        - Admin Panel
+        - API
+        - Frontend / UI
+        - Docker / Deployment
+        - Database / Migrations
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
