@@ -1116,8 +1116,15 @@ try:
             )
 except Exception as e:
     log.error(f"Error updating models: {e}")
-    pass
 
+if app.state.ef is None and not app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL:
+    log.error(
+        f"[STARTUP] Embedding model is None after initialization — "
+        f"engine='{app.state.config.RAG_EMBEDDING_ENGINE}' "
+        f"model='{app.state.config.RAG_EMBEDDING_MODEL}'. "
+        "RAG features will raise at call time. "
+        "Verify model path, DEVICE_TYPE, and HF cache."
+    )
 
 app.state.EMBEDDING_FUNCTION = get_embedding_function(
     app.state.config.RAG_EMBEDDING_ENGINE,

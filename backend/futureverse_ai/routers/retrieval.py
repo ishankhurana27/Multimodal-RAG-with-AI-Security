@@ -139,19 +139,28 @@ def get_ef(
     auto_update: bool = RAG_EMBEDDING_MODEL_AUTO_UPDATE,
 ):
     ef = None
-    if embedding_model and engine == "":
+    # "" = local sentence-transformers; "sentence_transformers" is the DB-stored alias for the same engine
+    if embedding_model and engine in ("", "sentence_transformers"):
         from sentence_transformers import SentenceTransformer
 
+        model_path = get_model_path(embedding_model, auto_update)
         try:
+            _st_mkwargs = dict(SENTENCE_TRANSFORMERS_MODEL_KWARGS or {})
+            _st_mkwargs.pop("device", None)
+
             ef = SentenceTransformer(
                 get_model_path(embedding_model, auto_update),
                 device=DEVICE_TYPE,
                 trust_remote_code=RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE,
                 backend=SENTENCE_TRANSFORMERS_BACKEND,
-                model_kwargs=SENTENCE_TRANSFORMERS_MODEL_KWARGS,
+                model_kwargs=_st_mkwargs or None,
             )
+            log.info(f"SentenceTransformer loaded: model='{embedding_model}' device={DEVICE_TYPE}")
         except Exception as e:
-            log.debug(f"Error loading SentenceTransformer: {e}")
+            log.error(
+                f"SentenceTransformer failed to load: model='{embedding_model}' "
+                f"path='{model_path}' device={DEVICE_TYPE} — {e}"
+            )
 
     return ef
 
@@ -332,7 +341,7 @@ class EmbeddingModelUpdateForm(BaseModel):
 
 
 def unload_embedding_model(request: Request):
-    if request.app.state.config.RAG_EMBEDDING_ENGINE == "":
+    if request.app.state.config.RAG_EMBEDDING_ENGINE in ("", "sentence_transformers"):
         # unloads current internal embedding model and clears VRAM cache
         request.app.state.ef = None
         request.app.state.EMBEDDING_FUNCTION = None

@@ -801,7 +801,7 @@ class EmbeddingChecker:
         self,
         texts: list[str],
         result: AgentResult,
-        expected_dim: int = 1024,
+        expected_dim: int = 0,
     ) -> AgentResult:
         t0         = time.monotonic()
         warnings   = list(result.warnings)

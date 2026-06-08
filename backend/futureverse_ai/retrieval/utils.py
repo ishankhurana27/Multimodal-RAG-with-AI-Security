@@ -1191,7 +1191,24 @@ def get_embedding_function(
     azure_api_version=None,
     enable_async=True,
 ) -> Awaitable:
-    if embedding_engine == "":
+    # "" = local sentence-transformers; "sentence_transformers" is the DB-stored alias for the same engine
+    if embedding_engine in ("", "sentence_transformers"):
+        if embedding_function is None:
+            log.error(
+                f"get_embedding_function: embedding_function is None for engine='{embedding_engine}' "
+                f"model='{embedding_model}'. SentenceTransformer did not load — "
+                "check startup logs for the root cause."
+            )
+
+            async def failed_embedding_function(query, prefix=None, user=None):
+                raise RuntimeError(
+                    f"Embedding model '{embedding_model}' is not loaded "
+                    f"(engine='{embedding_engine}'). "
+                    "Check backend startup logs for SentenceTransformer initialization errors."
+                )
+
+            return failed_embedding_function
+
         # Sentence transformers: CPU-bound sync operation
         async def async_embedding_function(query, prefix=None, user=None):
             return await asyncio.to_thread(

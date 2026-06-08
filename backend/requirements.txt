@@ -1,3 +1,11 @@
+# ── PyTorch CUDA (RTX 5090, CUDA 12.8) ────────────────────────────────────────
+# IMPORTANT: pip install MUST include --extra-index-url https://download.pytorch.org/whl/cu128
+# or these +cu128 wheels won't be found and pip will silently install CPU-only builds from PyPI.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+torchaudio==2.11.0+cu128
+
 fastapi==0.128.5
 uvicorn[standard]==0.40.0
 pydantic==2.12.5
@@ -58,8 +66,8 @@ chromadb==1.4.1
 weaviate-client==4.19.2
 opensearch-py==3.1.0
 
-transformers==5.1.0
-sentence-transformers==5.2.2
+transformers==5.10.2
+sentence-transformers==5.5.1
 keybert==0.8.5
 accelerate
 pyarrow==20.0.0 # fix: pin pyarrow version to 20 for rpi compatibility #15897

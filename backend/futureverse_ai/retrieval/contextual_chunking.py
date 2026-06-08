@@ -43,8 +43,8 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_OLLAMA_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 _DEFAULT_MODEL      = os.environ.get("CONTEXTUAL_CHUNKING_MODEL", "qwen2.5:7b")
-_CHUNK_TIMEOUT      = 30
-_DOC_TIMEOUT        = 60
+_CHUNK_TIMEOUT      = 60   # covers Vulkan cold-load on NVIDIA; CUDA would be ~3-8s/chunk
+_DOC_TIMEOUT        = 120   # GPU Vulkan: summary of ~3k chars takes <15s; 120s covers cold model load
 _MAX_WORKERS        = 3
 _MAX_DOC_CHARS      = 3000
 _MAX_CHUNK_CHARS    = 500
@@ -361,7 +361,7 @@ def apply_contextual_chunking(
     # ── Step 1: document summary (for logging only — context uses parent_text) ─
     print(f"\n  Step 1/2  Generating document summary ...", flush=True)
     t1          = time.monotonic()
-    doc_summary = _call_ollama(_doc_summary_prompt(full_doc_text), ollama_url, model, _DOC_TIMEOUT)
+    doc_summary = _call_ollama(_doc_summary_prompt(full_doc_text), ollama_url, model, _DOC_TIMEOUT, retries=0)
     summary_ms  = (time.monotonic() - t1) * 1000
 
     if doc_summary:
