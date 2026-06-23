@@ -577,7 +577,7 @@ async def query_doc_with_hybrid_search(
                 "distances": [[0.0]],
             }
 
-        distances = [d.metadata.get("score") for d in result]
+        distances = [(d.metadata.get("score") or 0.0) for d in result]  # guard None (Phase 1, M-10)
 
         # Build LLM-facing document content.
         # Base content priority: parent_text (hierarchical) → raw_text (contextual) → page_content.
@@ -841,8 +841,23 @@ async def query_collection_with_hybrid_search(
     # before launching tasks. Replaces N sequential single-string embedding calls
     # (one per VectorSearchRetriever invocation) with a single batched forward pass.
     _unique_queries = list(dict.fromkeys(queries))  # preserve order, deduplicate
-    _batch_embeddings = await embedding_function(_unique_queries, RAG_EMBEDDING_QUERY_PREFIX)
-    _embedding_cache = dict(zip(_unique_queries, _batch_embeddings))
+    # Cross-request query-embedding cache (Phase 3) — default OFF, fail-open, model-keyed.
+    from futureverse_ai.retrieval.embedding_cache import (
+        CACHE_ENABLED as _EMB_CACHE_ON,
+        get_cached as _emb_get,
+        set_cached as _emb_set,
+    )
+    _cached = _emb_get(_unique_queries) if _EMB_CACHE_ON else {}
+    _missing = [q for q in _unique_queries if q not in _cached]
+    if _missing:
+        _fresh_map = dict(
+            zip(_missing, await embedding_function(_missing, RAG_EMBEDDING_QUERY_PREFIX))
+        )
+        if _EMB_CACHE_ON:
+            _emb_set(_fresh_map)
+    else:
+        _fresh_map = {}
+    _embedding_cache = {**_cached, **_fresh_map}
 
     async def process_query(collection_name, query):
         async with _sem:
@@ -949,13 +964,15 @@ def generate_openai_batch_embeddings(
             f"{url}/embeddings",
             headers=headers,
             json=json_data,
+            timeout=(10, 120),  # (connect, read) — never hang the worker thread
         )
         r.raise_for_status()
         data = r.json()
         if "data" in data:
             return [elem["embedding"] for elem in data["data"]]
         else:
-            raise "Something went wrong :/"
+            # Was `raise "<str>"` (TypeError in Py3, masked the real failure).
+            raise RuntimeError(f"OpenAI embeddings response missing 'data': {data}")
     except Exception as e:
         log.exception(f"Error generating openai batch embeddings: {e}")
         return None
@@ -1035,6 +1052,7 @@ def generate_azure_openai_batch_embeddings(
                 url,
                 headers=headers,
                 json=json_data,
+                timeout=(10, 120),  # (connect, read) — never hang the worker thread
             )
             if r.status_code == 429:
                 retry = float(r.headers.get("Retry-After", "1"))
@@ -1125,6 +1143,7 @@ def generate_ollama_batch_embeddings(
             f"{url}/api/embed",
             headers=headers,
             json=json_data,
+            timeout=(10, 120),  # (connect, read) — never hang the worker thread
         )
         r.raise_for_status()
         data = r.json()
@@ -1132,7 +1151,8 @@ def generate_ollama_batch_embeddings(
         if "embeddings" in data:
             return data["embeddings"]
         else:
-            raise "Something went wrong :/"
+            # Was `raise "<str>"` (TypeError in Py3, masked the real failure).
+            raise RuntimeError(f"Ollama embeddings response missing 'embeddings': {data}")
     except Exception as e:
         log.exception(f"Error generating ollama batch embeddings: {e}")
         return None
@@ -1278,7 +1298,11 @@ def get_embedding_function(
                 return await embedding_function(query, prefix, user)
 
         return async_embedding_function
-    elif embedding_engine == "sentence_transformers":
+    elif embedding_engine == "sentence_transformers_cuda":
+        # Previously `== "sentence_transformers"`, which was UNREACHABLE (the first
+        # branch already matches that value) so this CUDA-stream loader never ran
+        # (Phase 1, C-1). Now opt-in via "sentence_transformers_cuda"; existing
+        # configs are unchanged. Use only on a GPU host with the model available locally.
         import torch
 
         if not hasattr(get_embedding_function, "_st_cache"):
@@ -1362,11 +1386,15 @@ async def generate_embeddings(
                 "user": user,
             }
         )
+        if embeddings is None:
+            raise RuntimeError(f"{engine} embedding request returned no data")
         return embeddings[0] if isinstance(text, str) else embeddings
     elif engine == "openai":
         embeddings = await agenerate_openai_batch_embeddings(
             model, text if isinstance(text, list) else [text], url, key, prefix, user
         )
+        if embeddings is None:
+            raise RuntimeError(f"{engine} embedding request returned no data")
         return embeddings[0] if isinstance(text, str) else embeddings
     elif engine == "azure_openai":
         azure_api_version = kwargs.get("azure_api_version", "")
@@ -1379,6 +1407,8 @@ async def generate_embeddings(
             prefix,
             user,
         )
+        if embeddings is None:
+            raise RuntimeError(f"{engine} embedding request returned no data")
         return embeddings[0] if isinstance(text, str) else embeddings
 
 
@@ -2066,8 +2096,12 @@ async def get_sources_from_items(
     try:
         import os
         from datetime import datetime
-        log_dir = r"D:\\FutureverseAI\\logs"
-        os.makedirs(log_dir, exist_ok=True)
+        _debug_on = os.environ.get("RAG_DEBUG_LOG", "false").lower() == "true"
+        # Was a hardcoded absolute Windows path that broke on Linux/Docker and
+        # wrote on every query; now portable + opt-in (RAG_DEBUG_LOG[_DIR]).
+        log_dir = os.environ.get("RAG_DEBUG_LOG_DIR", os.path.join(os.getcwd(), "logs"))
+        if _debug_on:
+            os.makedirs(log_dir, exist_ok=True)
         log_path    = os.path.join(log_dir, "retrieval_debug.log")
         _log_queries = queries
         _log_sources = len(query_results)
@@ -2097,7 +2131,8 @@ async def get_sources_from_items(
                         lf.write(f"  Text: {str(doc)[:400].replace(chr(10),' ')}...\\n")
                 lf.write("="*80 + "\\n")
 
-        await asyncio.to_thread(_write_debug_log)
+        if _debug_on:
+            await asyncio.to_thread(_write_debug_log)
     except Exception as e:
         log.warning(f"Retrieval debug log failed: {e}")
 
@@ -2312,6 +2347,7 @@ from typing import Optional, Sequence
 
 from langchain_core.callbacks import Callbacks
 from langchain_core.documents import BaseDocumentCompressor, Document
+from pydantic import ConfigDict
 
 
 class RerankCompressor(BaseDocumentCompressor):
@@ -2320,9 +2356,7 @@ class RerankCompressor(BaseDocumentCompressor):
     reranking_function: Any
     r_score: float
 
-    class Config:
-        extra = "forbid"
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     def compress_documents(
         self,

@@ -178,31 +178,92 @@ _YEAR_RE = re.compile(r"\b(20\d{2}|19\d{2})\b")
 def _promote_batch(batch_size: int = 500) -> dict:
     """
     Scan RELATES_TO edges in batches and create semantic parallel edges.
-    Returns counts per edge type.
-    """
-    counts = {
-        "CAUSES": 0,
-        "RESULTS_IN": 0,
-        "GOVERNED_BY": 0,
-        "EXPLAINS": 0,
-        "TRIGGERS": 0,
-        "CHARACTERIZED_BY": 0,
-        "RESULTS_FROM": 0,
-        "TESTED_IN": 0,
-        "DRIVES": 0,
-        "UNIFIES": 0,
-        "SUBSET_OF": 0,
-        "COMPONENT_OF": 0,
-        "ORIGINATED_BY": 0,
-        "CONFLICT_LINK": 0,
-        "MODIFIED_BY": 0,
-        "CONTAINS": 0,
-        "HAS_CONCEPT": 0,
-        "MENTIONED_IN": 0,
-        "SUMMARIZES": 0,
-    }
-    skip = 0
 
+    Batched (Phase 1, M-15): each batch of edges is classified in Python, then
+    ONE UNWIND MERGE is issued per edge type \u2014 replacing the previous ~16
+    per-edge round-trips with a handful per batch. Semantics are preserved:
+    the first group is mutually exclusive (first match wins) and the second is
+    independent (an edge may earn several typed edges).
+    """
+    counts = {k: 0 for k in [
+        "CAUSES", "RESULTS_IN", "GOVERNED_BY", "EXPLAINS", "TRIGGERS",
+        "CHARACTERIZED_BY", "RESULTS_FROM", "TESTED_IN", "DRIVES", "UNIFIES",
+        "SUBSET_OF", "COMPONENT_OF", "ORIGINATED_BY", "CONFLICT_LINK",
+        "MODIFIED_BY", "CONTAINS", "HAS_CONCEPT", "MENTIONED_IN", "SUMMARIZES",
+    ]}
+
+    # Group 1 \u2014 mutually exclusive (mirrors the original if/elif chain)
+    _EXCLUSIVE = [
+        (_CAUSES_PATTERNS, "CAUSES"),
+        (_RESULTS_IN_PATTERNS, "RESULTS_IN"),
+        (_EXPLAINS_PATTERNS, "EXPLAINS"),
+        (_TRIGGERS_PATTERNS, "TRIGGERS"),
+        (_CHARACTERIZED_BY_PATTERNS, "CHARACTERIZED_BY"),
+        (_RESULTS_FROM_PATTERNS, "RESULTS_FROM"),
+    ]
+    # Group 2 \u2014 independent (mirrors the original standalone if chain)
+    _INDEPENDENT = [
+        (_DRIVES_PATTERNS, "DRIVES"),
+        (_UNIFIES_PATTERNS, "UNIFIES"),
+        (_SUBSET_OF_PATTERNS, "SUBSET_OF"),
+        (_COMPONENT_OF_PATTERNS, "COMPONENT_OF"),
+        (_ORIGINATED_BY_PATTERNS, "ORIGINATED_BY"),
+        (_CONFLICT_LINK_PATTERNS, "CONFLICT_LINK"),
+        (_MODIFIED_BY_PATTERNS, "MODIFIED_BY"),
+        (_CONTAINS_PATTERNS, "CONTAINS"),
+        (_HAS_CONCEPT_PATTERNS, "HAS_CONCEPT"),
+        (_MENTIONED_IN_PATTERNS, "MENTIONED_IN"),
+        (_SUMMARIZES_PATTERNS, "SUMMARIZES"),
+    ]
+
+    def _flush(edge_type, rows):
+        if not rows:
+            return
+        try:
+            run_query(
+                f"UNWIND $rows AS row "
+                f"MATCH (a:Entity {{id: row.src}}), (b:Entity {{id: row.tgt}}) "
+                f"MERGE (a)-[s:{edge_type} {{original_relation: row.rel}}]->(b) "
+                f"ON CREATE SET s.chapter=row.ch, s.book=row.bk, s.source='promoted'",
+                {"rows": rows},
+            )
+            counts[edge_type] += len(rows)
+        except Exception as e:
+            log.debug(f"{edge_type} batch promotion error: {e}")
+
+    def _flush_governed(rows):
+        if not rows:
+            return
+        try:
+            run_query(
+                "UNWIND $rows AS row "
+                "MATCH (a:Entity {id: row.src}), (b:Entity {id: row.tgt}) "
+                "MERGE (a)-[s:GOVERNED_BY {context: row.rel}]->(b) "
+                "ON CREATE SET s.chapter=row.ch, s.book=row.bk, s.source='promoted'",
+                {"rows": rows},
+            )
+            counts["GOVERNED_BY"] += len(rows)
+        except Exception as e:
+            log.debug(f"GOVERNED_BY batch promotion error: {e}")
+
+    def _flush_tested(rows):
+        if not rows:
+            return
+        try:
+            run_query(
+                "UNWIND $rows AS row "
+                "MATCH (a:Entity {id: row.src}) "
+                "MERGE (q:ExamQuestion {id: row.tgt}) "
+                "  ON CREATE SET q.name=row.tgt, q.subject='upsc' "
+                "MERGE (a)-[s:TESTED_IN {year: row.year}]->(q) "
+                "ON CREATE SET s.type=row.etype, s.relation=row.rel, s.source='promoted'",
+                {"rows": rows},
+            )
+            counts["TESTED_IN"] += len(rows)
+        except Exception as e:
+            log.debug(f"TESTED_IN batch promotion error: {e}")
+
+    skip = 0
     while True:
         rows = run_query(
             """
@@ -218,274 +279,46 @@ def _promote_batch(batch_size: int = 500) -> dict:
             """,
             {"skip": skip, "limit": batch_size},
         )
-
         if not rows:
             break
+
+        acc = {et: [] for _, et in _EXCLUSIVE + _INDEPENDENT}
+        gov_rows = []
+        tested_rows = []
 
         for row in rows:
             src = row.get("src", "")
             tgt = row.get("tgt", "")
             rel = row.get("rel", "")
             chapter = row.get("chapter") or ""
-            book    = row.get("book")    or ""
-
+            book = row.get("book") or ""
             if not src or not tgt or not rel:
                 continue
+            base = {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book}
 
-            # ── CAUSES ────────────────────────────────────────────────────────
-            if _CAUSES_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:CAUSES {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["CAUSES"] += 1
-                except Exception as e:
-                    log.debug(f"CAUSES promotion error {src}->{tgt}: {e}")
-
-            # ── RESULTS_IN ────────────────────────────────────────────────────
-            elif _RESULTS_IN_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:RESULTS_IN {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["RESULTS_IN"] += 1
-                except Exception as e:
-                    log.debug(f"RESULTS_IN promotion error {src}->{tgt}: {e}")
-
-            # ── EXPLAINS ──────────────────────────────────────────────────────
-            elif _EXPLAINS_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:EXPLAINS {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["EXPLAINS"] += 1
-                except Exception as e:
-                    log.debug(f"EXPLAINS promotion error {src}->{tgt}: {e}")
-
-            # ── TRIGGERS — rapid-onset causation ──────────────────────────────
-            elif _TRIGGERS_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:TRIGGERS {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["TRIGGERS"] += 1
-                except Exception as e:
-                    log.debug(f"TRIGGERS promotion error {src}->{tgt}: {e}")
-
-            # ── CHARACTERIZED_BY — descriptive / definitional ─────────────────
-            elif _CHARACTERIZED_BY_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:CHARACTERIZED_BY {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["CHARACTERIZED_BY"] += 1
-                except Exception as e:
-                    log.debug(f"CHARACTERIZED_BY promotion error {src}->{tgt}: {e}")
-
-            # ── RESULTS_FROM — passive causal direction ───────────────────────
-            elif _RESULTS_FROM_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:RESULTS_FROM {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["RESULTS_FROM"] += 1
-                except Exception as e:
-                    log.debug(f"RESULTS_FROM promotion error {src}->{tgt}: {e}")
-
-            # ── DRIVES — continuous causal force ──────────────────────────────
-            if _DRIVES_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:DRIVES {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["DRIVES"] += 1
-                except Exception as e:
-                    log.debug(f"DRIVES promotion error {src}->{tgt}: {e}")
-
-            # ── UNIFIES — theory consolidation ────────────────────────────────
-            if _UNIFIES_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:UNIFIES {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["UNIFIES"] += 1
-                except Exception as e:
-                    log.debug(f"UNIFIES promotion error {src}->{tgt}: {e}")
-
-            # ── SUBSET_OF — taxonomic / type-of (All Subjects) ───────────────
-            if _SUBSET_OF_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:SUBSET_OF {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["SUBSET_OF"] += 1
-                except Exception as e:
-                    log.debug(f"SUBSET_OF promotion error {src}->{tgt}: {e}")
-
-            # ── COMPONENT_OF — structural composition (Polity / All) ──────────
-            if _COMPONENT_OF_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:COMPONENT_OF {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["COMPONENT_OF"] += 1
-                except Exception as e:
-                    log.debug(f"COMPONENT_OF promotion error {src}->{tgt}: {e}")
-
-            # ── ORIGINATED_BY — historical founding (History) ─────────────────
-            if _ORIGINATED_BY_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:ORIGINATED_BY {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["ORIGINATED_BY"] += 1
-                except Exception as e:
-                    log.debug(f"ORIGINATED_BY promotion error {src}->{tgt}: {e}")
-
-            # ── CONFLICT_LINK — opposition / war (History / Polity) ───────────
-            if _CONFLICT_LINK_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:CONFLICT_LINK {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["CONFLICT_LINK"] += 1
-                except Exception as e:
-                    log.debug(f"CONFLICT_LINK promotion error {src}->{tgt}: {e}")
-
-            # ── MODIFIED_BY — constitutional amendment (Polity) ───────────────
-            if _MODIFIED_BY_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:MODIFIED_BY {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["MODIFIED_BY"] += 1
-                except Exception as e:
-                    log.debug(f"MODIFIED_BY promotion error {src}->{tgt}: {e}")
-
-            # ── CONTAINS — container/collection relationship ──────────────────
-            if _CONTAINS_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:CONTAINS {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["CONTAINS"] += 1
-                except Exception as e:
-                    log.debug(f"CONTAINS promotion error {src}->{tgt}: {e}")
-
-            # ── HAS_CONCEPT — document/topic introduces a concept ─────────────
-            if _HAS_CONCEPT_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:HAS_CONCEPT {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["HAS_CONCEPT"] += 1
-                except Exception as e:
-                    log.debug(f"HAS_CONCEPT promotion error {src}->{tgt}: {e}")
-
-            # ── MENTIONED_IN — entity cited inside a source ───────────────────
-            if _MENTIONED_IN_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:MENTIONED_IN {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["MENTIONED_IN"] += 1
-                except Exception as e:
-                    log.debug(f"MENTIONED_IN promotion error {src}->{tgt}: {e}")
-
-            # ── SUMMARIZES — summary encapsulates content ─────────────────────
-            if _SUMMARIZES_PATTERNS.search(rel):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:SUMMARIZES {original_relation: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["SUMMARIZES"] += 1
-                except Exception as e:
-                    log.debug(f"SUMMARIZES promotion error {src}->{tgt}: {e}")
-
-            # ── GOVERNED_BY — based on target entity name ──────────────────────
+            for pat, et in _EXCLUSIVE:
+                if pat.search(rel):
+                    acc[et].append(base)
+                    break
+            for pat, et in _INDEPENDENT:
+                if pat.search(rel):
+                    acc[et].append(base)
             if _AUTHORITY_PATTERNS.search(tgt):
-                try:
-                    run_query(
-                        "MATCH (a:Entity {id: $src}), (b:Entity {id: $tgt}) "
-                        "MERGE (a)-[s:GOVERNED_BY {context: $rel}]->(b) "
-                        "ON CREATE SET s.chapter=$ch, s.book=$bk, s.source='promoted'",
-                        {"src": src, "tgt": tgt, "rel": rel, "ch": chapter, "bk": book},
-                    )
-                    counts["GOVERNED_BY"] += 1
-                except Exception as e:
-                    log.debug(f"GOVERNED_BY promotion error {src}->{tgt}: {e}")
-
-            # ── TESTED_IN — year detected in relation predicate ────────────────
+                gov_rows.append(base)
             m = _EXAM_YEAR_RE.search(rel)
             if m:
                 ym = _YEAR_RE.search(rel)
                 year = int(ym.group(1)) if ym else 0
-                exam_type = "Mains" if re.search(r"mains?", rel, re.I) else "Prelims"
                 if year:
-                    try:
-                        run_query(
-                            "MATCH (a:Entity {id: $src}) "
-                            "MERGE (q:ExamQuestion {id: $tgt}) "
-                            "  ON CREATE SET q.name=$tgt, q.subject='upsc' "
-                            "MERGE (a)-[s:TESTED_IN {year: $year}]->(q) "
-                            "ON CREATE SET s.type=$etype, s.relation=$rel, s.source='promoted'",
-                            {"src": src, "tgt": tgt, "rel": rel,
-                             "year": year, "etype": exam_type},
-                        )
-                        counts["TESTED_IN"] += 1
-                    except Exception as e:
-                        log.debug(f"TESTED_IN promotion error {src}: {e}")
+                    tested_rows.append({
+                        "src": src, "tgt": tgt, "rel": rel, "year": year,
+                        "etype": "Mains" if re.search(r"mains?", rel, re.I) else "Prelims",
+                    })
+
+        for et, rws in acc.items():
+            _flush(et, rws)
+        _flush_governed(gov_rows)
+        _flush_tested(tested_rows)
 
         skip += batch_size
 
@@ -805,27 +638,31 @@ def get_learning_path(start_entity: str, end_entity: str = "",
     """
     start_entity = start_entity.strip().lower()
 
+    # Cypher variable-length bounds (*1..N) must be LITERALS; they cannot be passed
+    # as a query parameter. Clamp to a safe int and inline it. (Phase 1, H-8)
+    _depth = max(1, min(int(max_depth), 10))
+
     if end_entity:
         end_entity = end_entity.strip().lower()
         rows = run_query(
             """
             MATCH path = shortestPath(
-                (a:Entity {id: $start})-[:PREREQUISITE_OF*1..$depth]->(b:Entity {id: $end})
+                (a:Entity {id: $start})-[:PREREQUISITE_OF*1..__DEPTH__]->(b:Entity {id: $end})
             )
             RETURN [n IN nodes(path) | n.id] AS learning_path
             LIMIT 3
-            """,
-            {"start": start_entity, "end": end_entity, "depth": max_depth},
+            """.replace("__DEPTH__", str(_depth)),
+            {"start": start_entity, "end": end_entity},
         )
     else:
         rows = run_query(
             """
-            MATCH path = (a:Entity {id: $start})-[:PREREQUISITE_OF*1..$depth]->(b:Entity)
+            MATCH path = (a:Entity {id: $start})-[:PREREQUISITE_OF*1..__DEPTH__]->(b:Entity)
             RETURN [n IN nodes(path) | n.id] AS learning_path
             ORDER BY length(path) DESC
             LIMIT 5
-            """,
-            {"start": start_entity, "depth": max_depth},
+            """.replace("__DEPTH__", str(_depth)),
+            {"start": start_entity},
         )
 
     return [row["learning_path"] for row in rows if row.get("learning_path")]

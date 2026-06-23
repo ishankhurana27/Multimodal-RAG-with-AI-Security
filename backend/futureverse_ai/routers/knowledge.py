@@ -714,15 +714,11 @@ def add_file_to_knowledge_by_id(
             import os, logging, traceback
             logger = logging.getLogger("neo4j_ingest")
             try:
-                logger.warning(f"[Neo4j] Thread started for file {_file_id}")
+                logger.info(f"[Neo4j] Thread started for file {_file_id}")
                 if not os.environ.get("NEO4J_URI"):
                     logger.warning("[Neo4j] NEO4J_URI not set. Skipping.")
                     return
-                # Short wait for embedding pipeline to finish writing to Weaviate
                 import time
-                logger.warning("[Neo4j] Waiting 30s for embedding to finish...")
-                time.sleep(30)
-
                 import weaviate
                 from futureverse_ai.retrieval.graph.extractor import extract_and_store
 
@@ -733,7 +729,38 @@ def add_file_to_knowledge_by_id(
                 )
 
                 collection_name = f"File_{_file_id.replace('-', '_')}"
-                logger.warning(f"[Neo4j] Reading chunks from {collection_name}")
+
+                # Wait for the embedding pipeline to finish writing to Weaviate by
+                # POLLING the collection's object count until it stops growing,
+                # instead of a blind fixed sleep (was time.sleep(30) — a race).
+                # Proceeds after NEO4J_INGEST_EMBED_WAIT seconds regardless.
+                _max_wait = int(os.environ.get("NEO4J_INGEST_EMBED_WAIT", "120"))
+                _poll = max(1, int(os.environ.get("NEO4J_INGEST_POLL_INTERVAL", "3")))
+                _deadline = time.time() + _max_wait
+                _prev, _stable = -1, 0
+                while time.time() < _deadline:
+                    try:
+                        if not client.collections.exists(collection_name):
+                            time.sleep(_poll)
+                            continue
+                        _cnt = (
+                            client.collections.get(collection_name)
+                            .aggregate.over_all(total_count=True)
+                            .total_count
+                        )
+                        if _cnt and _cnt == _prev:
+                            _stable += 1
+                            if _stable >= 2:        # unchanged for 2 polls -> embedding done
+                                break
+                        else:
+                            _stable = 0
+                        _prev = _cnt
+                    except Exception as _pe:
+                        logger.debug(f"[Neo4j] embedding poll: {_pe}")
+                    time.sleep(_poll)
+                logger.info(f"[Neo4j] Embedding ready (~{_prev} objects) for {collection_name}")
+
+                logger.info(f"[Neo4j] Reading chunks from {collection_name}")
                 col = client.collections.get(collection_name)
                 # Fetch ALL chunks via iterator (no hard 500-object cap)
                 all_objects = list(col.iterator())
@@ -776,7 +803,7 @@ def add_file_to_knowledge_by_id(
                     return "General"
 
                 doc_subject = _infer_subject(_doc_name)
-                logger.warning(f"[Neo4j] {len(chunks)} chunks | Subject: {doc_subject} | Doc: {_doc_name}")
+                logger.info(f"[Neo4j] {len(chunks)} chunks | Subject: {doc_subject} | Doc: {_doc_name}")
 
                 if not chunks:
                     logger.warning("[Neo4j] No chunks found")
@@ -793,7 +820,7 @@ def add_file_to_knowledge_by_id(
                         return False
                     return True
                 valid_chunks = [(i, c) for i, c in enumerate(chunks) if is_good_chunk(c.get("text", ""))]
-                logger.warning(f"[Neo4j] Processing {len(valid_chunks)} valid chunks")
+                logger.info(f"[Neo4j] Processing {len(valid_chunks)} valid chunks")
 
                 success = failed = 0
 
@@ -853,9 +880,9 @@ def add_file_to_knowledge_by_id(
                         failed += 1
                         logger.warning(f"[Neo4j] Chunk error: {chunk_err}")
                     if i % 10 == 0:
-                        logger.warning(f"[Neo4j] Progress: {i+1}/{len(valid_chunks)} | ok={success} fail={failed}")
+                        logger.info(f"[Neo4j] Progress: {i+1}/{len(valid_chunks)} | ok={success} fail={failed}")
 
-                logger.warning(f"[Neo4j] COMPLETE: {success}/{len(valid_chunks)} for {_doc_name} [{doc_subject}]")
+                logger.info(f"[Neo4j] COMPLETE: {success}/{len(valid_chunks)} for {_doc_name} [{doc_subject}]")
 
             except Exception as e:
                 logger.error("[Neo4j] THREAD CRASHED")
