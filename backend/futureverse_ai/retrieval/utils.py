@@ -577,7 +577,7 @@ async def query_doc_with_hybrid_search(
                 "distances": [[0.0]],
             }
 
-        distances = [d.metadata.get("score") for d in result]
+        distances = [(d.metadata.get("score") or 0.0) for d in result]  # guard None (Phase 1, M-10)
 
         # Build LLM-facing document content.
         # Base content priority: parent_text (hierarchical) → raw_text (contextual) → page_content.
@@ -841,8 +841,23 @@ async def query_collection_with_hybrid_search(
     # before launching tasks. Replaces N sequential single-string embedding calls
     # (one per VectorSearchRetriever invocation) with a single batched forward pass.
     _unique_queries = list(dict.fromkeys(queries))  # preserve order, deduplicate
-    _batch_embeddings = await embedding_function(_unique_queries, RAG_EMBEDDING_QUERY_PREFIX)
-    _embedding_cache = dict(zip(_unique_queries, _batch_embeddings))
+    # Cross-request query-embedding cache (Phase 3) — default OFF, fail-open, model-keyed.
+    from futureverse_ai.retrieval.embedding_cache import (
+        CACHE_ENABLED as _EMB_CACHE_ON,
+        get_cached as _emb_get,
+        set_cached as _emb_set,
+    )
+    _cached = _emb_get(_unique_queries) if _EMB_CACHE_ON else {}
+    _missing = [q for q in _unique_queries if q not in _cached]
+    if _missing:
+        _fresh_map = dict(
+            zip(_missing, await embedding_function(_missing, RAG_EMBEDDING_QUERY_PREFIX))
+        )
+        if _EMB_CACHE_ON:
+            _emb_set(_fresh_map)
+    else:
+        _fresh_map = {}
+    _embedding_cache = {**_cached, **_fresh_map}
 
     async def process_query(collection_name, query):
         async with _sem:
@@ -949,13 +964,15 @@ def generate_openai_batch_embeddings(
             f"{url}/embeddings",
             headers=headers,
             json=json_data,
+            timeout=(10, 120),  # (connect, read) — never hang the worker thread
         )
         r.raise_for_status()
         data = r.json()
         if "data" in data:
             return [elem["embedding"] for elem in data["data"]]
         else:
-            raise "Something went wrong :/"
+            # Was `raise "<str>"` (TypeError in Py3, masked the real failure).
+            raise RuntimeError(f"OpenAI embeddings response missing 'data': {data}")
     except Exception as e:
         log.exception(f"Error generating openai batch embeddings: {e}")
         return None
@@ -1035,6 +1052,7 @@ def generate_azure_openai_batch_embeddings(
                 url,
                 headers=headers,
                 json=json_data,
+                timeout=(10, 120),  # (connect, read) — never hang the worker thread
             )
             if r.status_code == 429:
                 retry = float(r.headers.get("Retry-After", "1"))
@@ -1125,6 +1143,7 @@ def generate_ollama_batch_embeddings(
             f"{url}/api/embed",
             headers=headers,
             json=json_data,
+            timeout=(10, 120),  # (connect, read) — never hang the worker thread
         )
         r.raise_for_status()
         data = r.json()
@@ -1132,7 +1151,8 @@ def generate_ollama_batch_embeddings(
         if "embeddings" in data:
             return data["embeddings"]
         else:
-            raise "Something went wrong :/"
+            # Was `raise "<str>"` (TypeError in Py3, masked the real failure).
+            raise RuntimeError(f"Ollama embeddings response missing 'embeddings': {data}")
     except Exception as e:
         log.exception(f"Error generating ollama batch embeddings: {e}")
         return None
@@ -1278,7 +1298,11 @@ def get_embedding_function(
                 return await embedding_function(query, prefix, user)
 
         return async_embedding_function
-    elif embedding_engine == "sentence_transformers":
+    elif embedding_engine == "sentence_transformers_cuda":
+        # Previously `== "sentence_transformers"`, which was UNREACHABLE (the first
+        # branch already matches that value) so this CUDA-stream loader never ran
+        # (Phase 1, C-1). Now opt-in via "sentence_transformers_cuda"; existing
+        # configs are unchanged. Use only on a GPU host with the model available locally.
         import torch
 
         if not hasattr(get_embedding_function, "_st_cache"):
@@ -1362,11 +1386,15 @@ async def generate_embeddings(
                 "user": user,
             }
         )
+        if embeddings is None:
+            raise RuntimeError(f"{engine} embedding request returned no data")
         return embeddings[0] if isinstance(text, str) else embeddings
     elif engine == "openai":
         embeddings = await agenerate_openai_batch_embeddings(
             model, text if isinstance(text, list) else [text], url, key, prefix, user
         )
+        if embeddings is None:
+            raise RuntimeError(f"{engine} embedding request returned no data")
         return embeddings[0] if isinstance(text, str) else embeddings
     elif engine == "azure_openai":
         azure_api_version = kwargs.get("azure_api_version", "")
@@ -1379,6 +1407,8 @@ async def generate_embeddings(
             prefix,
             user,
         )
+        if embeddings is None:
+            raise RuntimeError(f"{engine} embedding request returned no data")
         return embeddings[0] if isinstance(text, str) else embeddings
 
 
@@ -1545,6 +1575,59 @@ async def get_sources_from_items(
     print("└" + "─" * 60 + "┘", flush=True)
 
     _t0_total = time.perf_counter()
+
+    # === RAG RESULT CACHE — lookup ===
+    # Default OFF (ENABLE_RAG_RESULT_CACHE). Fail-open: any error falls through
+    # to the normal pipeline. Only collection-backed items are cacheable —
+    # text/note/chat/url attachments carry content the key can't capture.
+    _rc_key_parts = None
+    _rc_collections = []
+    try:
+        from futureverse_ai.retrieval import rag_cache as _rag_cache
+        if _rag_cache.RESULT_CACHE_ENABLED and not full_context and items:
+            _rc_cacheable = not getattr(
+                getattr(request.app.state, "config", None),
+                "BYPASS_EMBEDDING_AND_RETRIEVAL", False,
+            ) and all(
+                item.get("collection_name")
+                or item.get("collection_names")
+                or (
+                    item.get("type") in ("file", "collection")
+                    and item.get("id")
+                    and not item.get("context")
+                    and not item.get("docs")
+                )
+                for item in items
+            )
+            if _rc_cacheable:
+                _rc_collections = sorted(_quick_extract_collection_names(items))
+                _rc_key_parts = [
+                    _rc_collections,
+                    list(queries),
+                    k,
+                    bool(hybrid_search),
+                    bool(getattr(
+                        getattr(request.app.state, "config", None),
+                        "ENABLE_RAG_HYBRID_SEARCH_ENRICHED_TEXTS", False,
+                    )),
+                    _rag_cache.EMBEDDING_MODEL,
+                    bool(getattr(
+                        getattr(request.app.state, "config", None),
+                        "ENABLE_NEO4J", False,
+                    )),
+                ]
+                _rc_hit = _rag_cache.cache_get("result", _rc_key_parts)
+                if _rc_hit is not None:
+                    log.debug(
+                        "[RAG result cache] HIT — %d collections, %d queries",
+                        len(_rc_collections), len(queries),
+                    )
+                    return _rc_hit
+                log.debug("[RAG result cache] MISS")
+    except Exception as _rc_e:
+        log.debug("[RAG result cache] lookup failed (fail-open): %s", _rc_e)
+        _rc_key_parts = None
+    # === END RAG RESULT CACHE lookup ===
 
     # === QUERY ROUTING ===
     _primary_q = queries[0] if queries else ""
@@ -2066,8 +2149,12 @@ async def get_sources_from_items(
     try:
         import os
         from datetime import datetime
-        log_dir = r"D:\\FutureverseAI\\logs"
-        os.makedirs(log_dir, exist_ok=True)
+        _debug_on = os.environ.get("RAG_DEBUG_LOG", "false").lower() == "true"
+        # Was a hardcoded absolute Windows path that broke on Linux/Docker and
+        # wrote on every query; now portable + opt-in (RAG_DEBUG_LOG[_DIR]).
+        log_dir = os.environ.get("RAG_DEBUG_LOG_DIR", os.path.join(os.getcwd(), "logs"))
+        if _debug_on:
+            os.makedirs(log_dir, exist_ok=True)
         log_path    = os.path.join(log_dir, "retrieval_debug.log")
         _log_queries = queries
         _log_sources = len(query_results)
@@ -2097,7 +2184,8 @@ async def get_sources_from_items(
                         lf.write(f"  Text: {str(doc)[:400].replace(chr(10),' ')}...\\n")
                 lf.write("="*80 + "\\n")
 
-        await asyncio.to_thread(_write_debug_log)
+        if _debug_on:
+            await asyncio.to_thread(_write_debug_log)
     except Exception as e:
         log.warning(f"Retrieval debug log failed: {e}")
 
@@ -2263,6 +2351,31 @@ async def get_sources_from_items(
     except Exception as _rlog_err:
         log.debug("Retrieval summary print failed: %s", _rlog_err)
 
+    # === RAG RESULT CACHE — store ===
+    # Never cache errors, empty results, or the "__NO_RESULTS__" sentinel.
+    if _rc_key_parts is not None:
+        try:
+            from futureverse_ai.retrieval import rag_cache as _rag_cache
+            _rc_docs = [str(d) for s in sources for d in (s.get("document") or [])]
+            _rc_has_real = any(
+                not (isinstance(m, dict) and m.get("type") == "upsc_signal")
+                for s in sources
+                for m in (s.get("metadata") or [])
+            )
+            if _rc_docs and _rc_has_real and "__NO_RESULTS__" not in _rc_docs:
+                _rag_cache.cache_set(
+                    "result", _rc_key_parts, sources, _rag_cache.RESULT_CACHE_TTL
+                )
+                _rag_cache.kbidx_register(
+                    _rc_collections,
+                    _rag_cache.make_key("result", _rc_key_parts),
+                    _rag_cache.RESULT_CACHE_TTL,
+                )
+                log.debug("[RAG result cache] stored %d docs", len(_rc_docs))
+        except Exception as _rc_e:
+            log.debug("[RAG result cache] store failed (fail-open): %s", _rc_e)
+    # === END RAG RESULT CACHE store ===
+
     return sources
 
 
@@ -2312,6 +2425,7 @@ from typing import Optional, Sequence
 
 from langchain_core.callbacks import Callbacks
 from langchain_core.documents import BaseDocumentCompressor, Document
+from pydantic import ConfigDict
 
 
 class RerankCompressor(BaseDocumentCompressor):
@@ -2320,9 +2434,7 @@ class RerankCompressor(BaseDocumentCompressor):
     reranking_function: Any
     r_score: float
 
-    class Config:
-        extra = "forbid"
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     def compress_documents(
         self,
@@ -2358,7 +2470,88 @@ class RerankCompressor(BaseDocumentCompressor):
             def _rerank_on_gpu(query, docs):
                 with torch.cuda.device(0):
                     return self.reranking_function(query, docs)
-            scores = await asyncio.to_thread(_rerank_on_gpu, query, documents)
+
+            # === RAG RERANK CACHE — raw cross-encoder scores keyed by
+            # (sha256(query), sha256(chunk), reranker model). Default OFF;
+            # fail-open: any cache error scores everything as before. Only
+            # cache-misses are sent to the model; ordering/threshold logic
+            # downstream is unchanged (raw scores are cached pre-sigmoid).
+            _rk_parts, _rk_hits = None, None
+            try:
+                from futureverse_ai.retrieval import rag_cache as _rag_cache
+                if _rag_cache.RERANK_CACHE_ENABLED and documents:
+                    _rk_qh = hashlib.sha256(query.encode("utf-8")).hexdigest()
+                    _rk_parts = [
+                        [
+                            _rk_qh,
+                            hashlib.sha256(
+                                (doc.page_content or "").encode("utf-8")
+                            ).hexdigest(),
+                            _rag_cache.RERANKING_MODEL,
+                        ]
+                        for doc in documents
+                    ]
+                    _rk_hits = _rag_cache.cache_get_many("rerank", _rk_parts)
+                    log.debug(
+                        "[RAG rerank cache] %d/%d hits",
+                        sum(1 for v in _rk_hits if v is not None),
+                        len(documents),
+                    )
+            except Exception as _rk_e:
+                log.debug("[RAG rerank cache] lookup failed (fail-open): %s", _rk_e)
+                _rk_parts, _rk_hits = None, None
+
+            if _rk_hits is not None and all(v is not None for v in _rk_hits):
+                scores = [float(v) for v in _rk_hits]
+            else:
+                _rk_miss_idx = None
+                if _rk_hits is not None and any(v is not None for v in _rk_hits):
+                    # Partial hit: score only the misses, merge back in order.
+                    _rk_miss_idx = [
+                        i for i, v in enumerate(_rk_hits) if v is None
+                    ]
+                    _rk_miss_scores = await asyncio.to_thread(
+                        _rerank_on_gpu,
+                        query,
+                        [documents[i] for i in _rk_miss_idx],
+                    )
+                    _rk_miss_list = (
+                        list(_rk_miss_scores)
+                        if isinstance(_rk_miss_scores, list)
+                        else _rk_miss_scores.tolist()
+                    )
+                    if len(_rk_miss_list) == len(_rk_miss_idx):
+                        scores = [
+                            float(v) if v is not None else 0.0 for v in _rk_hits
+                        ]
+                        for _i, _s in zip(_rk_miss_idx, _rk_miss_list):
+                            scores[_i] = float(_s)
+                if scores is None:
+                    # Full miss (or partial merge mismatch): score everything.
+                    _rk_miss_idx = list(range(len(documents)))
+                    scores = await asyncio.to_thread(_rerank_on_gpu, query, documents)
+                # Write freshly computed scores back to the cache.
+                if _rk_parts is not None and scores is not None:
+                    try:
+                        from futureverse_ai.retrieval import rag_cache as _rag_cache
+                        _rk_all = (
+                            list(scores)
+                            if isinstance(scores, list)
+                            else scores.tolist()
+                        )
+                        _rag_cache.cache_set_many(
+                            "rerank",
+                            [
+                                (_rk_parts[_i], float(_rk_all[_i]))
+                                for _i in _rk_miss_idx
+                            ],
+                            _rag_cache.RERANK_CACHE_TTL,
+                        )
+                    except Exception as _rk_e:
+                        log.debug(
+                            "[RAG rerank cache] store failed (fail-open): %s", _rk_e
+                        )
+            # === END RAG RERANK CACHE ===
         else:
             query_embedding = await self.embedding_function(
                 query, RAG_EMBEDDING_QUERY_PREFIX

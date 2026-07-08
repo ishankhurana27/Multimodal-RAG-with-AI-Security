@@ -211,7 +211,8 @@ def _build_context_block(
     if chapter:       lines.append(f"Chapter: {chapter}")
     if section and section != chapter:
                       lines.append(f"Section: {section}")
-    lines.append(f"Position: paragraph {position} of {total}")
+    # Position omitted from embedded context: boilerplate dilutes the embedding;
+    # display still shows it via utils._build_context_header. (Phase 3)
     if topic:         lines.append(f"Topic: {topic}")
     if preceding_idea:lines.append(f"Preceding idea: {preceding_idea}")
     lines.append("")

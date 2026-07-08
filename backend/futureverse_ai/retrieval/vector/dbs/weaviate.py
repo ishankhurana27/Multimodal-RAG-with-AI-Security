@@ -206,14 +206,22 @@ class WeaviateClient(VectorDBBase):
             self.client.collections.delete(sane_collection_name)
 
     def _create_collection(self, collection_name: str) -> None:
-        # Use vectorizer_config=none so that objects accept a flat-list vector
-        # via batch.add_object(vector=[...]).  The named-vector API
-        # (Configure.Vectors.self_provided) would require dict-format vectors
-        # and target_vector on every search — that's not how the rest of the
-        # codebase works, so use the simple single-vector approach instead.
+        # Single self-provided (default, unnamed) vector so objects accept a
+        # flat-list vector via batch.add_object(vector=[...]) and search needs no
+        # target_vector. Prefer the non-deprecated weaviate-client >=4.16 API
+        # (vector_config + Configure.Vectors.self_provided); fall back to the
+        # legacy Configure.Vectorizer.none() on older clients. (Dep024 fix)
+        try:
+            _vec_kwargs = {
+                "vector_config": weaviate.classes.config.Configure.Vectors.self_provided()
+            }
+        except Exception:
+            _vec_kwargs = {
+                "vectorizer_config": weaviate.classes.config.Configure.Vectorizer.none()
+            }
         self.client.collections.create(
             name=collection_name,
-            vectorizer_config=weaviate.classes.config.Configure.Vectorizer.none(),
+            **_vec_kwargs,
             properties=[
                 weaviate.classes.config.Property(
                     name="text", data_type=weaviate.classes.config.DataType.TEXT

@@ -4,7 +4,7 @@ import time
 from typing import Optional
 import uuid
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 from futureverse_ai.internal.db import Base, JSONField, get_db, get_db_context
 
 from futureverse_ai.models.files import (
@@ -298,6 +298,12 @@ class KnowledgeTable:
                     .join(KnowledgeFile, File.id == KnowledgeFile.file_id)
                     .join(Knowledge, KnowledgeFile.knowledge_id == Knowledge.id)
                     .outerjoin(User, User.id == KnowledgeFile.user_id)
+                    # Keep large JSON columns out of the filesorted SELECT (err 1038).
+                    .options(
+                        defer(File.data), defer(File.meta),
+                        defer(User.info), defer(User.settings),
+                        defer(User.oauth), defer(User.scim),
+                    )
                 )
 
                 # Apply access-control directly to the joined query
@@ -463,6 +469,15 @@ class KnowledgeTable:
                     .join(KnowledgeFile, File.id == KnowledgeFile.file_id)
                     .outerjoin(User, User.id == KnowledgeFile.user_id)
                     .filter(KnowledgeFile.knowledge_id == knowledge_id)
+                    # Keep large JSON columns OUT of the SELECT that gets filesorted,
+                    # so ORDER BY rows stay narrow. They were overflowing MySQL
+                    # sort_buffer_size (err 1038) -> the except returned an empty
+                    # list -> Knowledge base showed "No content found".
+                    .options(
+                        defer(File.data), defer(File.meta),
+                        defer(User.info), defer(User.settings),
+                        defer(User.oauth), defer(User.scim),
+                    )
                 )
 
                 # Default sort: updated_at descending

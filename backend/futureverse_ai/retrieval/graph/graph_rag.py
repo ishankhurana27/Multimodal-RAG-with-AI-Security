@@ -222,6 +222,31 @@ def get_graph_source(
     if not neo4j_uri:
         return None
 
+    # === RAG KG CACHE — lookup ===
+    # Default OFF (ENABLE_RAG_KG_CACHE). Fail-open: any cache error falls
+    # through to the normal Neo4j pipeline. None results are never cached.
+    _kg_parts = None
+    try:
+        from futureverse_ai.retrieval import rag_cache as _rag_cache
+        if _rag_cache.KG_CACHE_ENABLED:
+            _kg_mc = metadata_context or {}
+            _kg_parts = [
+                list(queries),
+                limit,
+                _kg_mc.get("subject", ""),
+                _kg_mc.get("book", ""),
+                _kg_mc.get("chapter", ""),
+            ]
+            _kg_hit = _rag_cache.cache_get("kg", _kg_parts)
+            if _kg_hit is not None:
+                log.debug("[RAG KG cache] HIT — %d queries", len(queries))
+                return _kg_hit
+            log.debug("[RAG KG cache] MISS")
+    except Exception as _kg_e:
+        log.debug("[RAG KG cache] lookup failed (fail-open): %s", _kg_e)
+        _kg_parts = None
+    # === END RAG KG CACHE lookup ===
+
     try:
         from futureverse_ai.retrieval.graph.extractor import run_query
 
@@ -892,7 +917,7 @@ def get_graph_source(
         # retrieval/utils.py to boost vector chunks that mention these entities.
         found_entity_names = [x[2] for x in entity_results if x[2]]
 
-        return {
+        _graph_source = {
             "documents":    [[graph_text]],
             "entity_names": found_entity_names,   # ← re-ranker anchor list
             "metadatas": [[{
@@ -913,6 +938,20 @@ def get_graph_source(
                 "prereq_count":     len(prereq_results),
             }]],
         }
+
+        # === RAG KG CACHE — store (only non-None results reach this point) ===
+        if _kg_parts is not None:
+            try:
+                from futureverse_ai.retrieval import rag_cache as _rag_cache
+                _rag_cache.cache_set(
+                    "kg", _kg_parts, _graph_source, _rag_cache.KG_CACHE_TTL
+                )
+                log.debug("[RAG KG cache] stored graph context")
+            except Exception as _kg_e:
+                log.debug("[RAG KG cache] store failed (fail-open): %s", _kg_e)
+        # === END RAG KG CACHE store ===
+
+        return _graph_source
 
     except Exception as e:
         log.warning(f"Knowledge graph search failed: {e}")

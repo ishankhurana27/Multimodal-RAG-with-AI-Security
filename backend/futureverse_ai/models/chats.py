@@ -1203,6 +1203,44 @@ class ChatTable:
                             ]
                         )
                     )
+            elif dialect_name == "mysql":
+                # MySQL 8 JSON querying. JSON_TABLE expands the messages array so
+                # only string content values are matched (mirrors the sqlite/pg
+                # content search); tags use JSON_CONTAINS with a JSON-quoted param.
+                mysql_content_sql = """
+                EXISTS (
+                    SELECT 1
+                    FROM JSON_TABLE(
+                        Chat.chat, '$.messages[*]'
+                        COLUMNS (content TEXT PATH '$.content')
+                    ) AS message
+                    WHERE LOWER(message.content) LIKE CONCAT('%', :content_key, '%')
+                )
+                """
+                mysql_content_clause = text(mysql_content_sql)
+                query = query.filter(
+                    or_(
+                        Chat.title.ilike(bindparam("title_key")),
+                        mysql_content_clause,
+                    )
+                ).params(title_key=f"%{search_text}%", content_key=search_text.lower())
+
+                # Check if there are any tags to filter, it should have all the tags
+                if "none" in tag_ids:
+                    query = query.filter(
+                        text("COALESCE(JSON_LENGTH(Chat.meta, '$.tags'), 0) = 0")
+                    )
+                elif tag_ids:
+                    query = query.filter(
+                        and_(
+                            *[
+                                text(
+                                    f"JSON_CONTAINS(Chat.meta, JSON_QUOTE(:tag_id_{tag_idx}), '$.tags')"
+                                ).params(**{f"tag_id_{tag_idx}": tag_id})
+                                for tag_idx, tag_id in enumerate(tag_ids)
+                            ]
+                        )
+                    )
             else:
                 raise NotImplementedError(
                     f"Unsupported dialect: {db.bind.dialect.name}"
@@ -1304,6 +1342,13 @@ class ChatTable:
                         "EXISTS (SELECT 1 FROM json_array_elements_text(Chat.meta->'tags') elem WHERE elem = :tag_id)"
                     )
                 ).params(tag_id=tag_id)
+            elif db.bind.dialect.name == "mysql":
+                # MySQL JSON query for tags within the meta JSON field
+                query = query.filter(
+                    text(
+                        "JSON_CONTAINS(Chat.meta, JSON_QUOTE(:tag_id), '$.tags')"
+                    )
+                ).params(tag_id=tag_id)
             else:
                 raise NotImplementedError(
                     f"Unsupported dialect: {db.bind.dialect.name}"
@@ -1349,6 +1394,15 @@ class ChatTable:
                 query = query.filter(
                     text(
                         "EXISTS (SELECT 1 FROM json_array_elements_text(Chat.meta->'tags') elem WHERE elem = :tag_id)"
+                    )
+                ).params(tag_id=tag_id)
+            elif db.bind.dialect.name == "mysql":
+                # JSON_QUOTE turns the bind param into a JSON string literal so the
+                # comparison is injection-safe; JSON_CONTAINS returns NULL (→ no match)
+                # when $.tags is absent.
+                query = query.filter(
+                    text(
+                        "JSON_CONTAINS(Chat.meta, JSON_QUOTE(:tag_id), '$.tags')"
                     )
                 ).params(tag_id=tag_id)
             else:
