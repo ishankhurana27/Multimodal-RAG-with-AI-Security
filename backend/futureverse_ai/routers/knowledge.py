@@ -6,6 +6,7 @@ from fastapi.concurrency import run_in_threadpool
 import logging
 import os
 import io
+import re
 import zipfile
 
 from sqlalchemy.orm import Session
@@ -94,6 +95,33 @@ def remove_knowledge_base_metadata_embedding(knowledge_base_id: str) -> bool:
     except Exception as e:
         log.debug(f"Failed to remove embedding for {knowledge_base_id}: {e}")
         return False
+
+
+def _purge_rag_result_cache(kb_id: str, file_id: Optional[str] = None) -> None:
+    """Invalidate cached RAG retrieval results for a knowledge base after it
+    is mutated, so stale answers are never served from the result cache.
+
+    No-op unless ENABLE_RAG_RESULT_CACHE is on; fail-open on any Redis error.
+    Purges the KB's own collection plus the affected file's collection under
+    both naming schemes ("file-{id}" raw and the sanitized "File_..." form
+    used by the Weaviate client)."""
+    try:
+        from futureverse_ai.retrieval.rag_cache import purge_collections
+
+        collections = [kb_id]
+        if file_id:
+            raw = f"file-{file_id}"
+            collections.append(raw)
+            sanitized = re.sub(r"[^a-zA-Z0-9_]", "", raw.replace("-", "_")).strip("_")
+            if sanitized:
+                if not sanitized[0].isalpha():
+                    sanitized = "C" + sanitized
+                else:
+                    sanitized = sanitized[0].upper() + sanitized[1:]
+                collections.append(sanitized)
+        purge_collections(collections)
+    except Exception as e:
+        log.debug(f"RAG result cache purge failed (fail-open): {e}")
 
 
 class KnowledgeAccessResponse(KnowledgeUserResponse):
@@ -345,6 +373,8 @@ async def reindex_knowledge_files(
                     failed_files.append({"file_id": file.id, "error": str(e)})
                     continue
 
+            _purge_rag_result_cache(knowledge_base.id)
+
         except Exception as e:
             log.error(f"Error processing knowledge base {knowledge_base.id}: {str(e)}")
             # Don't raise, just continue
@@ -385,6 +415,7 @@ async def reindex_knowledge_base_metadata_embeddings(
     for kb in knowledge_bases:
         if await embed_knowledge_base_metadata(request, kb.id, kb.name, kb.description):
             success_count += 1
+            _purge_rag_result_cache(kb.id)
 
     log.info(f"Embedding reindex complete: {success_count}/{len(knowledge_bases)}")
     return {"total": len(knowledge_bases), "success": success_count}
@@ -708,6 +739,8 @@ def add_file_to_knowledge_by_id(
             knowledge_id=id, file_id=form_data.file_id, user_id=user.id, db=db
         )
 
+        _purge_rag_result_cache(id, form_data.file_id)
+
         # === AUTO NEO4J GRAPH INGESTION ===
         import threading as _threading
         def _ingest_to_neo4j(_file_id: str, _doc_name: str, _collection_name: str):
@@ -977,6 +1010,8 @@ def update_file_from_knowledge_by_id(
             detail=str(e),
         )
 
+    _purge_rag_result_cache(id, form_data.file_id)
+
     if knowledge:
         return KnowledgeFilesResponse(
             **knowledge.model_dump(),
@@ -1035,6 +1070,8 @@ def remove_file_from_knowledge_by_id(
     Knowledges.remove_file_from_knowledge_by_id(
         knowledge_id=id, file_id=form_data.file_id, db=db
     )
+
+    _purge_rag_result_cache(id, form_data.file_id)
 
     # Remove content from the vector database
     try:

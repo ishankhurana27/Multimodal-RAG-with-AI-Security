@@ -1576,6 +1576,59 @@ async def get_sources_from_items(
 
     _t0_total = time.perf_counter()
 
+    # === RAG RESULT CACHE — lookup ===
+    # Default OFF (ENABLE_RAG_RESULT_CACHE). Fail-open: any error falls through
+    # to the normal pipeline. Only collection-backed items are cacheable —
+    # text/note/chat/url attachments carry content the key can't capture.
+    _rc_key_parts = None
+    _rc_collections = []
+    try:
+        from futureverse_ai.retrieval import rag_cache as _rag_cache
+        if _rag_cache.RESULT_CACHE_ENABLED and not full_context and items:
+            _rc_cacheable = not getattr(
+                getattr(request.app.state, "config", None),
+                "BYPASS_EMBEDDING_AND_RETRIEVAL", False,
+            ) and all(
+                item.get("collection_name")
+                or item.get("collection_names")
+                or (
+                    item.get("type") in ("file", "collection")
+                    and item.get("id")
+                    and not item.get("context")
+                    and not item.get("docs")
+                )
+                for item in items
+            )
+            if _rc_cacheable:
+                _rc_collections = sorted(_quick_extract_collection_names(items))
+                _rc_key_parts = [
+                    _rc_collections,
+                    list(queries),
+                    k,
+                    bool(hybrid_search),
+                    bool(getattr(
+                        getattr(request.app.state, "config", None),
+                        "ENABLE_RAG_HYBRID_SEARCH_ENRICHED_TEXTS", False,
+                    )),
+                    _rag_cache.EMBEDDING_MODEL,
+                    bool(getattr(
+                        getattr(request.app.state, "config", None),
+                        "ENABLE_NEO4J", False,
+                    )),
+                ]
+                _rc_hit = _rag_cache.cache_get("result", _rc_key_parts)
+                if _rc_hit is not None:
+                    log.debug(
+                        "[RAG result cache] HIT — %d collections, %d queries",
+                        len(_rc_collections), len(queries),
+                    )
+                    return _rc_hit
+                log.debug("[RAG result cache] MISS")
+    except Exception as _rc_e:
+        log.debug("[RAG result cache] lookup failed (fail-open): %s", _rc_e)
+        _rc_key_parts = None
+    # === END RAG RESULT CACHE lookup ===
+
     # === QUERY ROUTING ===
     _primary_q = queries[0] if queries else ""
     _route = _classify_query_route(_primary_q)
@@ -2298,6 +2351,31 @@ async def get_sources_from_items(
     except Exception as _rlog_err:
         log.debug("Retrieval summary print failed: %s", _rlog_err)
 
+    # === RAG RESULT CACHE — store ===
+    # Never cache errors, empty results, or the "__NO_RESULTS__" sentinel.
+    if _rc_key_parts is not None:
+        try:
+            from futureverse_ai.retrieval import rag_cache as _rag_cache
+            _rc_docs = [str(d) for s in sources for d in (s.get("document") or [])]
+            _rc_has_real = any(
+                not (isinstance(m, dict) and m.get("type") == "upsc_signal")
+                for s in sources
+                for m in (s.get("metadata") or [])
+            )
+            if _rc_docs and _rc_has_real and "__NO_RESULTS__" not in _rc_docs:
+                _rag_cache.cache_set(
+                    "result", _rc_key_parts, sources, _rag_cache.RESULT_CACHE_TTL
+                )
+                _rag_cache.kbidx_register(
+                    _rc_collections,
+                    _rag_cache.make_key("result", _rc_key_parts),
+                    _rag_cache.RESULT_CACHE_TTL,
+                )
+                log.debug("[RAG result cache] stored %d docs", len(_rc_docs))
+        except Exception as _rc_e:
+            log.debug("[RAG result cache] store failed (fail-open): %s", _rc_e)
+    # === END RAG RESULT CACHE store ===
+
     return sources
 
 
@@ -2392,7 +2470,88 @@ class RerankCompressor(BaseDocumentCompressor):
             def _rerank_on_gpu(query, docs):
                 with torch.cuda.device(0):
                     return self.reranking_function(query, docs)
-            scores = await asyncio.to_thread(_rerank_on_gpu, query, documents)
+
+            # === RAG RERANK CACHE — raw cross-encoder scores keyed by
+            # (sha256(query), sha256(chunk), reranker model). Default OFF;
+            # fail-open: any cache error scores everything as before. Only
+            # cache-misses are sent to the model; ordering/threshold logic
+            # downstream is unchanged (raw scores are cached pre-sigmoid).
+            _rk_parts, _rk_hits = None, None
+            try:
+                from futureverse_ai.retrieval import rag_cache as _rag_cache
+                if _rag_cache.RERANK_CACHE_ENABLED and documents:
+                    _rk_qh = hashlib.sha256(query.encode("utf-8")).hexdigest()
+                    _rk_parts = [
+                        [
+                            _rk_qh,
+                            hashlib.sha256(
+                                (doc.page_content or "").encode("utf-8")
+                            ).hexdigest(),
+                            _rag_cache.RERANKING_MODEL,
+                        ]
+                        for doc in documents
+                    ]
+                    _rk_hits = _rag_cache.cache_get_many("rerank", _rk_parts)
+                    log.debug(
+                        "[RAG rerank cache] %d/%d hits",
+                        sum(1 for v in _rk_hits if v is not None),
+                        len(documents),
+                    )
+            except Exception as _rk_e:
+                log.debug("[RAG rerank cache] lookup failed (fail-open): %s", _rk_e)
+                _rk_parts, _rk_hits = None, None
+
+            if _rk_hits is not None and all(v is not None for v in _rk_hits):
+                scores = [float(v) for v in _rk_hits]
+            else:
+                _rk_miss_idx = None
+                if _rk_hits is not None and any(v is not None for v in _rk_hits):
+                    # Partial hit: score only the misses, merge back in order.
+                    _rk_miss_idx = [
+                        i for i, v in enumerate(_rk_hits) if v is None
+                    ]
+                    _rk_miss_scores = await asyncio.to_thread(
+                        _rerank_on_gpu,
+                        query,
+                        [documents[i] for i in _rk_miss_idx],
+                    )
+                    _rk_miss_list = (
+                        list(_rk_miss_scores)
+                        if isinstance(_rk_miss_scores, list)
+                        else _rk_miss_scores.tolist()
+                    )
+                    if len(_rk_miss_list) == len(_rk_miss_idx):
+                        scores = [
+                            float(v) if v is not None else 0.0 for v in _rk_hits
+                        ]
+                        for _i, _s in zip(_rk_miss_idx, _rk_miss_list):
+                            scores[_i] = float(_s)
+                if scores is None:
+                    # Full miss (or partial merge mismatch): score everything.
+                    _rk_miss_idx = list(range(len(documents)))
+                    scores = await asyncio.to_thread(_rerank_on_gpu, query, documents)
+                # Write freshly computed scores back to the cache.
+                if _rk_parts is not None and scores is not None:
+                    try:
+                        from futureverse_ai.retrieval import rag_cache as _rag_cache
+                        _rk_all = (
+                            list(scores)
+                            if isinstance(scores, list)
+                            else scores.tolist()
+                        )
+                        _rag_cache.cache_set_many(
+                            "rerank",
+                            [
+                                (_rk_parts[_i], float(_rk_all[_i]))
+                                for _i in _rk_miss_idx
+                            ],
+                            _rag_cache.RERANK_CACHE_TTL,
+                        )
+                    except Exception as _rk_e:
+                        log.debug(
+                            "[RAG rerank cache] store failed (fail-open): %s", _rk_e
+                        )
+            # === END RAG RERANK CACHE ===
         else:
             query_embedding = await self.embedding_function(
                 query, RAG_EMBEDDING_QUERY_PREFIX
