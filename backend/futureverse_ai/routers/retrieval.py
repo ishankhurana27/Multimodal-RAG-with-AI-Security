@@ -1540,6 +1540,7 @@ def save_docs_to_vector_db(
         result = VECTOR_DB_CLIENT.query(
             collection_name=collection_name,
             filter={"hash": metadata["hash"]},
+            limit=10000,  # fetch all matching chunks (avoid Weaviate's 25 default cap)
         )
         if result is not None and result.ids and len(result.ids) > 0:
             existing_doc_ids = result.ids[0]
@@ -1663,7 +1664,12 @@ def process_file(
                 # Usage: /knowledge/{id}/file/add, /knowledge/{id}/file/update
 
                 result = VECTOR_DB_CLIENT.query(
-                    collection_name=f"file-{file.id}", filter={"file_id": file.id}
+                    collection_name=f"file-{file.id}",
+                    filter={"file_id": file.id},
+                    # Without a limit, Weaviate applies its default cap (25), silently
+                    # dropping chunks for any file with >25 chunks when it is added to a
+                    # knowledge base. Fetch ALL of the file's chunks.
+                    limit=10000,
                 )
 
                 if result is not None and len(result.ids[0]) > 0:

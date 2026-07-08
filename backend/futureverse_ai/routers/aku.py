@@ -45,18 +45,32 @@ class AKULinkRequest(BaseModel):
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _get_ncert_anchor(aku: dict) -> str:
-    """Extract the verbatim NCERT sentence from gate_5_measurability.evidence."""
+    """Extract the verbatim NCERT text used for BM25 chunk-linking.
+
+    Priority:
+      1. source_citation.verbatim_excerpt  — literal copy-paste from the book;
+         highest BM25 recall because it appears word-for-word in the chunk.
+      2. so_what_protocol.gate_5_measurability.evidence  — fallback when
+         source_citation is absent (older Q-Matrix format).
+    """
+    # Priority 1: verbatim excerpt (literal book text)
+    citation = aku.get("source_citation") or {}
+    verbatim = (citation.get("verbatim_excerpt") or "").strip()
+    if verbatim:
+        return verbatim
+
+    # Priority 2: gate_5_measurability evidence
     proto = aku.get("so_what_protocol") or {}
     gate5 = proto.get("gate_5_measurability") or {}
-    return gate5.get("evidence", "")
+    return (gate5.get("evidence") or "").strip()
 
 
 def _build_aku_rich_text(aku: dict) -> str:
     """Build the rich-text document that represents one AKU node for embedding.
 
-    Combines the label, description, verbatim NCERT anchor, wrong belief, and
+    Combines the label, description, verbatim NCERT excerpt, wrong belief, and
     FITB sentence so that:
-      • Semantic search on the NCERT anchor matches the exact book passage.
+      • Semantic search on the verbatim excerpt matches the exact book passage.
       • Semantic search on the wrong belief matches PYQ distractor options.
       • Semantic search on the description matches paraphrased PYQ stems.
     """
@@ -67,9 +81,16 @@ def _build_aku_rich_text(aku: dict) -> str:
         "",
     ]
 
+    # Verbatim book text (source_citation preferred, gate_5 fallback)
     ncert = _get_ncert_anchor(aku)
     if ncert:
-        lines += [f"**NCERT Anchor:** {ncert}", ""]
+        lines += [f"**NCERT Verbatim:** {ncert}", ""]
+
+    # Location note gives semantic context (e.g. "Para under 'Gram Sabha' section")
+    citation = aku.get("source_citation") or {}
+    location = (citation.get("location_note") or "").strip()
+    if location:
+        lines += [f"**Location:** {location}", ""]
 
     lines += [
         f"**Knowledge Structure:** {aku.get('knowledge_structure_type', '')}",
@@ -198,8 +219,9 @@ def link_aku_to_chunks(
     if not form_data.aku_nodes:
         return {"status": "ok", "links_created": 0, "skipped": 0}
 
-    links_created = 0
-    skipped       = 0
+    links_created  = 0
+    skipped        = 0
+    chunk_mappings: list[dict] = []   # [{aku_id, chunk_id, chunk_text, bm25_score}]
 
     for aku in form_data.aku_nodes:
         aku_id       = aku.get("aku_id", "")
@@ -224,31 +246,42 @@ def link_aku_to_chunks(
         top_uuid      = result.ids[0][0]
         existing_meta = (result.metadatas[0][0] or {}) if result.metadatas else {}
         existing_ids  = existing_meta.get("aku_ids", "")
+        top_score     = (result.distances[0][0] if result.distances else 0.0) or 0.0
+        top_text      = (result.documents[0][0] if result.documents else "") or ""
 
         # Append only if not already present
         current_set = set(existing_ids.split(",")) if existing_ids else set()
-        if aku_id in current_set:
-            skipped += 1
-            continue
-
-        current_set.add(aku_id)
-        new_aku_ids = ",".join(sorted(current_set))
-
-        patched = VECTOR_DB_CLIENT.update_object_properties(
-            collection_name=form_data.book_collection_name,
-            object_id=top_uuid,
-            properties={"aku_ids": new_aku_ids},
-        )
-        if patched:
-            links_created += 1
-            log.debug("aku_link: linked aku_id=%s → chunk %s", aku_id, top_uuid)
+        if aku_id not in current_set:
+            current_set.add(aku_id)
+            new_aku_ids = ",".join(sorted(current_set))
+            patched = VECTOR_DB_CLIENT.update_object_properties(
+                collection_name=form_data.book_collection_name,
+                object_id=top_uuid,
+                properties={"aku_ids": new_aku_ids},
+            )
+            if patched:
+                links_created += 1
+                log.debug("aku_link: linked aku_id=%s → chunk %s", aku_id, top_uuid)
+            else:
+                skipped += 1
+                continue
         else:
-            skipped += 1
+            # Already linked — still record the mapping so caller can write it to MongoDB
+            log.debug("aku_link: aku_id=%s already in chunk %s", aku_id, top_uuid)
+
+        # Record chunk mapping regardless of whether the patch was new or pre-existing
+        chunk_mappings.append({
+            "aku_id":      aku_id,
+            "chunk_id":    top_uuid,
+            "chunk_text":  top_text,
+            "bm25_score":  round(float(top_score), 4),
+        })
 
     return {
-        "status":        "ok",
-        "chapter_id":    form_data.chapter_id,
-        "collection":    form_data.book_collection_name,
-        "links_created": links_created,
-        "skipped":       skipped,
+        "status":         "ok",
+        "chapter_id":     form_data.chapter_id,
+        "collection":     form_data.book_collection_name,
+        "links_created":  links_created,
+        "skipped":        skipped,
+        "chunk_mappings": chunk_mappings,   # written back to Q-Matrix by caller
     }

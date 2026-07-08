@@ -47,3 +47,6 @@
 # Misc
 *.env text eol=lf
 *.lock text eol=lf
+
+# Python (Phase 4 — was missing; caused CRLF/LF drift on Windows checkouts)
+*.py text eol=lf

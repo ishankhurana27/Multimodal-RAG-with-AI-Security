@@ -1,4 +1,13 @@
-﻿import asyncio
+﻿# Silence benign DeprecationWarnings from SWIG-generated C bindings (e.g.
+# sentencepiece) that fire at import time on Python 3.11+. (log-noise cleanup)
+import warnings as _swig_warnings
+_swig_warnings.filterwarnings(
+    "ignore",
+    message=r"builtin type [Ss]wig\w* has no __module__ attribute",
+    category=DeprecationWarning,
+)
+
+import asyncio
 import inspect
 import json
 import logging
@@ -2500,6 +2509,51 @@ async def healthcheck():
 async def healthcheck_with_db():
     ScopedSession.execute(text("SELECT 1;")).all()
     return {"status": True}
+
+
+@app.get("/health/ready")
+async def healthcheck_ready():
+    """Readiness probe (Phase 4): per-dependency, fail-soft. Returns 503 when a
+    critical dependency (database, vector DB) is unreachable so orchestrators do
+    not route traffic before the stack is up."""
+    import os as _os
+    from fastapi.responses import JSONResponse
+
+    deps = {}
+    try:
+        ScopedSession.execute(text("SELECT 1;")).all()
+        deps["database"] = "ok"
+    except Exception as e:
+        deps["database"] = f"error: {e}"
+
+    try:
+        from futureverse_ai.retrieval.vector.factory import VECTOR_DB_CLIENT
+        VECTOR_DB_CLIENT.has_collection(collection_name="__readiness_probe__")
+        deps["vector_db"] = "ok"
+    except Exception as e:
+        deps["vector_db"] = f"error: {e}"
+
+    if _os.environ.get("NEO4J_URI"):
+        try:
+            from futureverse_ai.retrieval.graph.extractor import run_query
+            run_query("RETURN 1 AS ok")
+            deps["neo4j"] = "ok"
+        except Exception as e:
+            deps["neo4j"] = f"error: {e}"
+
+    try:
+        import requests as _rq
+        _u = _os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        _rq.get(f"{_u}/api/version", timeout=(3, 5)).raise_for_status()
+        deps["ollama"] = "ok"
+    except Exception as e:
+        deps["ollama"] = f"error: {e}"
+
+    ready = deps.get("database") == "ok" and deps.get("vector_db") == "ok"
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"ready": ready, "dependencies": deps},
+    )
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

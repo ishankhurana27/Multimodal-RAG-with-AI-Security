@@ -81,6 +81,15 @@ venv.bak/
 .env.development.local
 .env.test.local
 .env.production.local
+.webui_secret_key
+secrets/
+*.bak
+
+# --- External service data dirs (if created inside the repo) ---
+atlas_work/
+neo4j_data/
+neo4j_db/
+.claude/
 
 # ─── Databases (local runtime data) ─────────────────────────────────────────
 *.db
@@ -90,7 +99,9 @@ venv.bak/
 backend/data/
 
 # ─── Vector DB local storage ─────────────────────────────────────────────────
-weaviate/
+# Ignore Weaviate's local data but KEEP the service config (needed to run it).
+weaviate/*
+!weaviate/docker-compose.yml
 qdrant_storage/
 backend/qdrant_storage/
 chroma_data/
