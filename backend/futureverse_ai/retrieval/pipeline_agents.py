@@ -236,6 +236,14 @@ class ChunkingAgent:
         if getattr(request.app.state.config, "CHUNKING_STRATEGY", "") == "foundation":
             return self._foundation_split(docs, t0)
 
+        # ── H3-section strategy (one chunk per ### section ONLY) ────────────────
+        # Emits each '###' section — with its '####'+ sub-parts and body — as a
+        # single verbatim chunk. '#'/'##' do not create chunks (they only set the
+        # breadcrumb); content not under a '###' is not indexed. Bypasses the
+        # markdown pre-split + fixed-size splitting entirely.
+        if getattr(request.app.state.config, "CHUNKING_STRATEGY", "") == "heading":
+            return self._heading_split(docs, t0)
+
         # ── Markdown header pre-split ──────────────────────────────────────────
         if request.app.state.config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER:
             markdown_splitter = MarkdownHeaderTextSplitter(
@@ -444,6 +452,100 @@ class ChunkingAgent:
         print(
             f"  [2/4] Foundation split → {len(out)} paragraph chunks"
             f"  (content-type aware, verbatim, 2-6 sentences)",
+            flush=True,
+        )
+        return AgentResult(
+            agent="ChunkingAgent",
+            ok=bool(out),
+            data=out,
+            elapsed_s=time.monotonic() - t0,
+            warnings=warnings,
+        )
+
+    def _heading_split(self, docs: list[Document], t0: float) -> AgentResult:
+        """
+        H3-section chunking — one chunk per '###' section, and ONLY '###'.
+
+        Each '###' heading starts a chunk that holds everything until the next
+        heading of level <= 3 (the next '###', '##' or '#'), including its
+        '####'+ sub-parts, images and body — verbatim. '#' and '##' headings do
+        NOT create chunks: they only update the breadcrumb context. Any content
+        that is not under a '###' (chapter intros, '##'-only sections and their
+        text) is therefore NOT indexed. So a chapter with nine '###' produces
+        exactly nine chunks.
+
+        Sections are emitted whole: no fixed-size splitting and no markdown
+        pre-split. Chunk Size / Overlap / Text Splitter settings do not apply.
+        """
+        import re
+        heading_re = re.compile(r"^(#{1,6})[ \t]+(.*\S)\s*$")
+
+        warnings: list[str] = []
+        out: list[Document] = []
+
+        for doc in docs:
+            base_meta = dict(doc.metadata)
+            h1 = h2 = h3 = ""            # running heading context (for breadcrumb)
+            cur_crumb = None             # (h1, h2, h3) of the OPEN ### section, else None
+            cur_lines: list[str] = []
+            sections: list[tuple] = []   # (h1, h2, h3, text)
+
+            def _close():
+                # Emit the currently-open ### section, if any.
+                if cur_crumb is not None:
+                    text = "\n".join(cur_lines).strip()
+                    if text:
+                        sections.append((*cur_crumb, text))
+
+            for line in doc.page_content.splitlines():
+                m = heading_re.match(line)
+                level = len(m.group(1)) if m else 0
+                if m and level == 3:
+                    # New '###' section — close the previous one, open this one.
+                    _close()
+                    h3 = m.group(2).strip()
+                    cur_crumb = (h1, h2, h3)
+                    cur_lines = [line]
+                elif m and level <= 2:
+                    # '#' / '##' — update context only; end any open ### section
+                    # and drop the loose (non-###) content that follows.
+                    _close()
+                    cur_crumb = None
+                    cur_lines = []
+                    title = m.group(2).strip()
+                    if level == 1:
+                        h1, h2, h3 = title, "", ""
+                    else:
+                        h2, h3 = title, ""
+                else:
+                    # Body / image / '####'+ heading — keep only inside a ### section.
+                    if cur_crumb is not None:
+                        cur_lines.append(line)
+            _close()
+
+            for seq, (c1, c2, c3, text) in enumerate(sections):
+                crumbs = [c for c in (c1, c2, c3) if c]
+                md = dict(base_meta)
+                md.update({
+                    "raw_text":            text,          # BM25 + display source
+                    "has_context":         False,         # set True by enrichment stage
+                    "content_type":        "body_text",
+                    "position_in_section": seq,
+                    "paragraph_sequence":  seq,
+                    "token_count":         max(1, len(text) // 4),
+                    "chunk_id":            str(uuid.uuid4()),
+                    "header_1":            c1,
+                    "header_2":            c2,
+                })
+                if crumbs:
+                    md["breadcrumb"] = " > ".join(crumbs)
+                out.append(Document(page_content=text, metadata=md))
+
+        if not out:
+            warnings.append("H3 chunker produced no ### sections")
+        print(
+            f"  [2/4] Heading split    → {len(out)} sections"
+            f"  (one chunk per ### section, verbatim; #/## not chunked)",
             flush=True,
         )
         return AgentResult(

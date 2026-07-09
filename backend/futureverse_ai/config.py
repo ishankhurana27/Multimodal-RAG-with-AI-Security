@@ -3028,6 +3028,7 @@ SEMANTIC_DEDUP_THRESHOLD = PersistentConfig(
 #                   PARAGRAPH_MIN_SENTENCES (default 2), PARAGRAPH_MAX_SENTENCES (default 6),
 #                   PARAGRAPH_MAX_CHILD_CHARS (default 1500), PARAGRAPH_MAX_PARENT_CHARS (default 4000).
 #   "hierarchical" — fixed-size parent-child: parents≤CHUNK_SIZE, children≤CHUNK_SIZE//4.
+#   "heading"      — one chunk per '###' section ONLY (verbatim); '#'/'##' are not chunked.
 #   "fixed"        — single-level fixed character/token split.
 CHUNKING_STRATEGY = PersistentConfig(
     "CHUNKING_STRATEGY",
