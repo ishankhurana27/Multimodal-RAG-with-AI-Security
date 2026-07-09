@@ -39,8 +39,10 @@ docker-compose up -d
 cd backend
 pip install -r requirements.txt
 alembic upgrade head
-python -m futureverse_ai.main
-```
+
+
+ powershell -ExecutionPolicy Bypass -File .\start-backend.ps1
+ 
 
 ### 4. Frontend (development)
 ```bash
