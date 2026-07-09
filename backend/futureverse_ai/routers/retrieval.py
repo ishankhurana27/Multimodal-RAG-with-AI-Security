@@ -1663,12 +1663,12 @@ def process_file(
                 # Check if the file has already been processed and save the content
                 # Usage: /knowledge/{id}/file/add, /knowledge/{id}/file/update
 
+                # Explicit high limit: without it the vector DB applies its
+                # default query limit (Weaviate = 25), which silently truncates
+                # large files to the first 25 chunks when added to a KB.
                 result = VECTOR_DB_CLIENT.query(
                     collection_name=f"file-{file.id}",
                     filter={"file_id": file.id},
-                    # Without a limit, Weaviate applies its default cap (25), silently
-                    # dropping chunks for any file with >25 chunks when it is added to a
-                    # knowledge base. Fetch ALL of the file's chunks.
                     limit=10000,
                 )
 
