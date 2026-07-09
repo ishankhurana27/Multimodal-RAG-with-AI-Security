@@ -6,7 +6,7 @@ Falls back to direct Ollama extraction if Atlas-RAG fails.
 """
 import os, re, json, csv, glob, logging, shutil, tempfile, threading, sys
 from pathlib import Path
-from neo4j import GraphDatabase
+from neo4j import GraphDatabase, Query
 from futureverse_ai.retrieval.graph.community_detection import build_graph_communities
 
 log = logging.getLogger(__name__)
@@ -16,6 +16,8 @@ NEO4J_URI       = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER      = os.environ.get("NEO4J_USERNAME", os.environ.get("NEO4J_USER", "neo4j"))
 NEO4J_PASSWORD  = os.environ.get("NEO4J_PASSWORD", "password")
 NEO4J_DATABASE  = os.environ.get("NEO4J_DATABASE", "neo4j")
+NEO4J_QUERY_TIMEOUT = float(os.environ.get("NEO4J_QUERY_TIMEOUT", "30"))  # seconds (Phase 1, C-5)
+KG_IMPORT_BATCH = int(os.environ.get("KG_IMPORT_BATCH", "500"))  # UNWIND batch size (Phase 1, M-13)
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 KG_MODEL        = os.environ.get("KG_EXTRACT_MODEL", "llama3.1:8b")
 # atlas-rag is installed via pip (requirements.txt) — no sys.path needed.
@@ -66,6 +68,7 @@ def _ensure_indexes():
 # ── Neo4j ─────────────────────────────────────────────────────────────────────
 _driver = None
 _driver_lock = threading.Lock()
+_counter_lock = threading.Lock()  # guards IMPORT_COUNTER (Phase 1, M-17)
 _indexes_created = False
 _hubs_marked    = False   # set True after first mark_generic_hubs() run
 
@@ -75,7 +78,7 @@ def get_driver(force_new=False):
         if _driver is None or force_new:
             if _driver is not None:
                 try: _driver.close()
-                except: pass
+                except Exception: pass
             _driver = GraphDatabase.driver(
                 NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD),
                 max_connection_lifetime=300, max_connection_pool_size=5, keep_alive=True,
@@ -99,7 +102,7 @@ def run_query(cypher, params=None):
     for attempt in range(3):
         try:
             with get_driver().session(database=NEO4J_DATABASE) as s:
-                return [dict(r) for r in s.run(cypher, params or {})]
+                return [dict(r) for r in s.run(Query(cypher, timeout=NEO4J_QUERY_TIMEOUT), params or {})]
         except Exception as e:
             msg = str(e).lower()
             if any(x in msg for x in ["defunct","routing","no data","closed","unavailable","unauthorized"]):
@@ -877,6 +880,23 @@ def _safe_cleanup(work_dir):
     # Last resort: ignore errors
     shutil.rmtree(work_dir, ignore_errors=True)
 
+def _flush(session, cypher, rows, extra):
+    """Run one UNWIND batch; on failure fall back to row-by-row so a single bad
+    row can't drop the whole batch. Returns rows attempted. (Phase 1, M-13)"""
+    if not rows:
+        return 0
+    try:
+        session.run(cypher, {"rows": rows, **extra})
+    except Exception as e:
+        log.warning(f"KG import batch of {len(rows)} failed ({e}); retrying row-by-row")
+        for _r in rows:
+            try:
+                session.run(cypher, {"rows": [_r], **extra})
+            except Exception as e2:
+                log.debug(f"KG import row skipped: {e2}")
+    return len(rows)
+
+
 # ── Neo4j Import ──────────────────────────────────────────────────────────────
 def _import_csv_to_neo4j(output_dir, subject, book, chapter, class_level, doc_name):
     node_count = rel_count = concept_count = concept_rel_count = 0
@@ -884,36 +904,41 @@ def _import_csv_to_neo4j(output_dir, subject, book, chapter, class_level, doc_na
     with get_driver().session(database=NEO4J_DATABASE) as session:
 
         # 1. Entity nodes: triple_nodes_*_without_emb.csv  →  name:ID, type, concepts, :LABEL
+        _node_cy = (
+            "UNWIND $rows AS row "
+            "MERGE (n:Entity {id: row.id}) "
+            "ON CREATE SET n.name=row.id, n.type=row.type, n.text=row.id, "
+            "n.subject=$subject, n.book=$book, "
+            "n.chapter=$chapter, n.class_level=$cl, n.doc_name=$dn, "
+            "n.concepts=row.concepts, n.mention_count=1, "
+            "n.source='atlas_rag', n.created_at=timestamp() "
+            "ON MATCH SET "
+            "n.name=CASE WHEN n.name IS NULL OR n.name='' THEN row.id ELSE n.name END, "
+            "n.subject=CASE WHEN n.subject IS NULL OR n.subject='' THEN $subject ELSE n.subject END, "
+            "n.chapter=CASE WHEN n.chapter IS NULL OR n.chapter='' THEN $chapter ELSE n.chapter END, "
+            "n.book=CASE WHEN n.book IS NULL OR n.book='' THEN $book ELSE n.book END, "
+            "n.concepts=CASE WHEN n.concepts IS NULL OR n.concepts=[] THEN row.concepts ELSE n.concepts END, "
+            "n.mention_count=coalesce(n.mention_count,0)+1 "
+            "WITH n WHERE n.mention_count > 10 SET n:HighYield"
+        )
+        _node_extra = {"subject": subject, "book": book, "chapter": chapter,
+                       "cl": class_level, "dn": doc_name}
         for f in _find_csvs(output_dir, "triple_nodes_"):
             log.debug(f"Entity nodes: {os.path.basename(f)}")
             try:
                 with open(f, encoding="utf-8") as cf:
+                    batch = []
                     for row in csv.DictReader(cf):
                         name  = (row.get("name:ID") or "").lower().strip()
                         etype = (row.get("type")    or "Entity").strip()
                         if not name or len(name) < 2 or _is_noise_entity(name):
                             continue
-                        concepts_list = _parse_concepts(row.get("concepts") or "")
-                        session.run(
-                            "MERGE (n:Entity {id: $id}) "
-                            "ON CREATE SET n.name=$id, n.type=$type, n.text=$id, "
-                            "n.subject=$subject, n.book=$book, "
-                            "n.chapter=$chapter, n.class_level=$cl, n.doc_name=$dn, "
-                            "n.concepts=$concepts, n.mention_count=1, "
-                            "n.source='atlas_rag', n.created_at=timestamp() "
-                            "ON MATCH SET "
-                            "n.name=CASE WHEN n.name IS NULL OR n.name='' THEN $id ELSE n.name END, "
-                            "n.subject=CASE WHEN n.subject IS NULL OR n.subject='' THEN $subject ELSE n.subject END, "
-                            "n.chapter=CASE WHEN n.chapter IS NULL OR n.chapter='' THEN $chapter ELSE n.chapter END, "
-                            "n.book=CASE WHEN n.book IS NULL OR n.book='' THEN $book ELSE n.book END, "
-                            "n.concepts=CASE WHEN n.concepts IS NULL OR n.concepts=[] THEN $concepts ELSE n.concepts END, "
-                            "n.mention_count=coalesce(n.mention_count,0)+1 "
-                            "WITH n WHERE n.mention_count > 10 SET n:HighYield",
-                            {"id": name, "type": etype, "subject": subject,
-                             "book": book, "chapter": chapter, "cl": class_level,
-                             "dn": doc_name, "concepts": concepts_list}
-                        )
-                        node_count += 1
+                        batch.append({"id": name, "type": etype,
+                                      "concepts": _parse_concepts(row.get("concepts") or "")})
+                        if len(batch) >= KG_IMPORT_BATCH:
+                            node_count += _flush(session, _node_cy, batch, _node_extra)
+                            batch = []
+                    node_count += _flush(session, _node_cy, batch, _node_extra)
             except Exception as e:
                 log.warning(f"triple_nodes error ({f}): {e}")
 
@@ -926,130 +951,137 @@ def _import_csv_to_neo4j(output_dir, subject, book, chapter, class_level, doc_na
         plain_edge_files = [f for f in all_edge_files if "with_concept" not in f]
         edge_files_to_use = enriched_files if enriched_files else plain_edge_files
 
+        _edge_cy = (
+            "UNWIND $rows AS row "
+            "MERGE (a:Entity {id: row.src}) "
+            "  ON CREATE SET a.name=row.src, a.source='edge_ref', a.created_at=timestamp() "
+            "MERGE (b:Entity {id: row.tgt}) "
+            "  ON CREATE SET b.name=row.tgt, b.source='edge_ref', b.created_at=timestamp() "
+            "MERGE (a)-[r:RELATES_TO {relation: row.rel}]->(b) "
+            "ON CREATE SET r.book=$book, r.chapter=$chapter, "
+            "r.source='atlas_rag', r.concepts=row.concepts, r.weight=1 "
+            "ON MATCH SET r.weight=coalesce(r.weight,1)+1"
+        )
         for f in edge_files_to_use:
             log.debug(f"Entity rels ({'enriched' if enriched_files else 'plain'}): {os.path.basename(f)}")
             try:
                 with open(f, encoding="utf-8") as cf:
+                    batch = []
                     for row in csv.DictReader(cf):
                         src = (row.get(":START_ID") or "").strip().lower()
                         tgt = (row.get(":END_ID")   or "").strip().lower()
                         rel = (row.get("relation")  or "relates to").strip().lower()
                         if not src or not tgt: continue
                         if _is_noise_entity(src) or _is_noise_entity(tgt): continue
-                        rel_norm  = re.sub(r"\s+", " ", rel)[:120]
-                        edge_concepts = _parse_concepts(row.get("concepts") or "")
-                        try:
-                            session.run(
-                                # Node MERGE: give ghost nodes a minimal but valid name so
-                                # they never appear as null-name nodes in audit queries.
-                                # Full metadata is filled in (or enriched) by the node CSV
-                                # pass that runs before this loop.
-                                "MERGE (a:Entity {id: $src}) "
-                                "  ON CREATE SET a.name=$src, a.source='edge_ref', "
-                                "               a.created_at=timestamp() "
-                                "MERGE (b:Entity {id: $tgt}) "
-                                "  ON CREATE SET b.name=$tgt, b.source='edge_ref', "
-                                "               b.created_at=timestamp() "
-                                "MERGE (a)-[r:RELATES_TO {relation: $rel}]->(b) "
-                                "ON CREATE SET r.book=$book, r.chapter=$chapter, "
-                                "r.source='atlas_rag', r.concepts=$concepts, r.weight=1 "
-                                "ON MATCH SET r.weight=coalesce(r.weight,1)+1",
-                                {"src": src, "tgt": tgt, "rel": rel_norm,
-                                 "book": book, "chapter": chapter,
-                                 "concepts": edge_concepts}
-                            )
-                            rel_count += 1
-                        except Exception as re_err:
-                            log.debug(f"Rel error {src}->{tgt}: {re_err}")
+                        batch.append({"src": src, "tgt": tgt,
+                                      "rel": re.sub(r"\s+", " ", rel)[:120],
+                                      "concepts": _parse_concepts(row.get("concepts") or "")})
+                        if len(batch) >= KG_IMPORT_BATCH:
+                            rel_count += _flush(session, _edge_cy, batch, {"book": book, "chapter": chapter})
+                            batch = []
+                    rel_count += _flush(session, _edge_cy, batch, {"book": book, "chapter": chapter})
             except Exception as e:
                 log.warning(f"triple_edges error ({f}): {e}")
 
         # 3. Concept nodes: concept_nodes_*.csv  →  concept_id:ID, name, :LABEL
+        _concept_cy = (
+            "UNWIND $rows AS row "
+            "MERGE (c:Concept {concept_id: row.cid}) "
+            "ON CREATE SET c.name=row.name, c.id=row.name, "
+            "c.source='atlas_rag', c.subject=$subject, c.created_at=timestamp()"
+        )
         for f in _find_csvs(output_dir, "concept_nodes_"):
             log.debug(f"Concept nodes: {os.path.basename(f)}")
             try:
                 with open(f, encoding="utf-8") as cf:
+                    batch = []
                     for row in csv.DictReader(cf):
                         cid  = (row.get("concept_id:ID") or "").strip()
                         name = (row.get("name")          or "").strip()
                         if not name or len(name) < 2: continue
-                        session.run(
-                            "MERGE (c:Concept {concept_id: $cid}) "
-                            "ON CREATE SET c.name=$name, c.id=$name, "
-                            "c.source='atlas_rag', c.subject=$subject, c.created_at=timestamp()",
-                            {"cid": cid, "name": name, "subject": subject}
-                        )
-                        concept_count += 1
+                        batch.append({"cid": cid, "name": name})
+                        if len(batch) >= KG_IMPORT_BATCH:
+                            concept_count += _flush(session, _concept_cy, batch, {"subject": subject})
+                            batch = []
+                    concept_count += _flush(session, _concept_cy, batch, {"subject": subject})
             except Exception as e:
                 log.warning(f"concept_nodes error ({f}): {e}")
 
         # 4. Concept edges: concept_edges_*.csv  →  entity HAS_CONCEPT concept
+        _concept_edge_cy = (
+            "UNWIND $rows AS row "
+            "MATCH (e:Entity {id: row.src}) "
+            "MATCH (c:Concept {concept_id: row.tgt}) "
+            "MERGE (e)-[:HAS_CONCEPT]->(c)"
+        )
         for f in _find_csvs(output_dir, "concept_edges_"):
             log.debug(f"Concept edges: {os.path.basename(f)}")
             try:
                 with open(f, encoding="utf-8") as cf:
+                    batch = []
                     for row in csv.DictReader(cf):
                         src = (row.get(":START_ID") or "").strip()
                         tgt = (row.get(":END_ID")   or "").strip()
                         if not src or not tgt: continue
-                        try:
-                            session.run(
-                                "MATCH (e:Entity {id: $src}) "
-                                "MATCH (c:Concept {concept_id: $tgt}) "
-                                "MERGE (e)-[:HAS_CONCEPT]->(c)",
-                                {"src": src, "tgt": tgt}
-                            )
-                            concept_rel_count += 1
-                        except Exception as ce:
-                            log.debug(f"Concept rel error: {ce}")
+                        batch.append({"src": src, "tgt": tgt})
+                        if len(batch) >= KG_IMPORT_BATCH:
+                            concept_rel_count += _flush(session, _concept_edge_cy, batch, {})
+                            batch = []
+                    concept_rel_count += _flush(session, _concept_edge_cy, batch, {})
             except Exception as e:
                 log.warning(f"concept_edges error ({f}): {e}")
 
         # 5. TextSource nodes: text_nodes_*_from_json.csv  →  original passages
         #    Preserves source evidence for each entity — enables citation & grounding.
         text_count = 0
+        _text_cy = (
+            "UNWIND $rows AS row "
+            "MERGE (t:TextSource {id: row.tid}) "
+            "ON CREATE SET t.text=row.text, t.subject=$subject, "
+            "t.chapter=$chapter, t.book=$book, "
+            "t.source='atlas_rag', t.created_at=timestamp()"
+        )
         for f in _find_csvs(output_dir, "text_nodes_"):
             log.debug(f"TextSource nodes: {os.path.basename(f)}")
             try:
                 with open(f, encoding="utf-8") as cf:
+                    batch = []
                     for row in csv.DictReader(cf):
                         tid  = (row.get("text_id:ID")    or "").strip()
                         text = (row.get("original_text") or "").strip()
                         if not tid or not text:
                             continue
-                        session.run(
-                            "MERGE (t:TextSource {id: $tid}) "
-                            "ON CREATE SET t.text=$text, t.subject=$subject, "
-                            "t.chapter=$chapter, t.book=$book, "
-                            "t.source='atlas_rag', t.created_at=timestamp()",
-                            {"tid": tid, "text": text[:2000],
-                             "subject": subject, "chapter": chapter, "book": book}
-                        )
-                        text_count += 1
+                        batch.append({"tid": tid, "text": text[:2000]})
+                        if len(batch) >= KG_IMPORT_BATCH:
+                            text_count += _flush(session, _text_cy, batch, {"subject": subject, "chapter": chapter, "book": book})
+                            batch = []
+                    text_count += _flush(session, _text_cy, batch, {"subject": subject, "chapter": chapter, "book": book})
             except Exception as e:
                 log.warning(f"text_nodes error ({f}): {e}")
 
         # 6. Source edges: text_edges_*_from_json.csv  →  Entity -[:MENTIONED_IN]-> TextSource
         src_edge_count = 0
+        _text_edge_cy = (
+            "UNWIND $rows AS row "
+            "MATCH (e:Entity {id: row.eid}) "
+            "MATCH (t:TextSource {id: row.tid}) "
+            "MERGE (e)-[:MENTIONED_IN]->(t)"
+        )
         for f in _find_csvs(output_dir, "text_edges_"):
             log.debug(f"Source edges: {os.path.basename(f)}")
             try:
                 with open(f, encoding="utf-8") as cf:
+                    batch = []
                     for row in csv.DictReader(cf):
                         eid = (row.get(":START_ID") or "").strip().lower()
                         tid = (row.get(":END_ID")   or "").strip()
                         if not eid or not tid:
                             continue
-                        try:
-                            session.run(
-                                "MATCH (e:Entity {id: $eid}) "
-                                "MATCH (t:TextSource {id: $tid}) "
-                                "MERGE (e)-[:MENTIONED_IN]->(t)",
-                                {"eid": eid, "tid": tid}
-                            )
-                            src_edge_count += 1
-                        except Exception as se:
-                            log.debug(f"Source edge error {eid}->{tid}: {se}")
+                        batch.append({"eid": eid, "tid": tid})
+                        if len(batch) >= KG_IMPORT_BATCH:
+                            src_edge_count += _flush(session, _text_edge_cy, batch, {})
+                            batch = []
+                    src_edge_count += _flush(session, _text_edge_cy, batch, {})
             except Exception as e:
                 log.warning(f"text_edges error ({f}): {e}")
 
@@ -1170,10 +1202,12 @@ def _run_atlas_extraction(text, doc_id, subject, book, chapter, class_level, doc
         )
         try:
             global IMPORT_COUNTER
-            IMPORT_COUNTER += 1
+            with _counter_lock:           # atomic read-modify-read (Phase 1, M-17)
+                IMPORT_COUNTER += 1
+                _ic = IMPORT_COUNTER
 
             # Every 25 imports: collapse parallel edges + run global UPSC janitor
-            if IMPORT_COUNTER % 25 == 0:
+            if _ic % 25 == 0:
                 threading.Thread(
                     target=deduplicate_edges,
                     daemon=True,
@@ -1184,10 +1218,11 @@ def _run_atlas_extraction(text, doc_id, subject, book, chapter, class_level, doc
                 ).start()
 
             # Every 50 imports: rebuild community summaries
-            if IMPORT_COUNTER % 50 == 0:
+            if _ic % 50 == 0:
                 threading.Thread(
                     target=build_graph_communities,
                     args=(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD),
+                    daemon=True,          # was non-daemon → could block shutdown (Phase 1, M-16)
                 ).start()
         except Exception as e:
             log.warning(f"Post-import maintenance failed: {e}")
@@ -1292,7 +1327,11 @@ def _fallback_extract(text, doc_id, doc_name, subject, book, chapter, class_leve
         raw = raw[s:e]
         # Multi-pass JSON repair for common LLM output issues
         raw = re.sub(r",\s*([\]}])", r"\1", raw)          # trailing commas
-        raw = re.sub(r"(?<!\\)'", '"', raw)               # single → double quotes
+        # Only convert single→double quotes when there are NO double quotes at all
+        # (LLM used single quotes throughout). Otherwise apostrophes inside values
+        # (e.g. "Gandhi's") get corrupted into broken JSON. (Phase 1, H-9)
+        if '"' not in raw:
+            raw = raw.replace("'", '"')
         raw = re.sub(r'("(?:[^"\\]|\\.)*")|(\b\w+)\s*:', # unquoted keys
                      lambda m: m.group(1) if m.group(1) else f'"{m.group(2)}":', raw)
         try:
@@ -1341,7 +1380,7 @@ def _fallback_extract(text, doc_id, doc_name, subject, book, chapter, class_leve
                             {"s": src, "t": tgt, "rel": rel_str}
                         )
                         rc += 1
-                    except: pass
+                    except Exception: pass
         return {"status": "success", "nodes": nc, "relationships": rc,
                 "doc_id": doc_id, "source": "fallback"}
     except Exception as e:
@@ -1366,7 +1405,7 @@ def extract_and_store(
         log.warning(f"Atlas-RAG not available ({e}), using fallback")
         return _fallback_extract(text, doc_id, doc_name, subject, book, chapter, class_level, page_number)
     except Exception as e:
-        log.warning(f"Atlas-RAG failed ({e}), using fallback")
+        log.error(f"Atlas-RAG extraction failed ({e}); falling back to direct extraction", exc_info=True)
         return _fallback_extract(text, doc_id, doc_name, subject, book, chapter, class_level, page_number)
 
 

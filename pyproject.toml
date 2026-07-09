@@ -21,7 +21,7 @@ dependencies = [
     "authlib==1.6.7",
 
     "requests==2.32.5",
-    "aiohttp==3.13.2", # do not update to 3.13.3 - broken
+    "aiohttp==3.14.1",  # security: 3.13.4/3.13.5 fixed CVE-2026-3644 + zip-bomb (Phase 2)
     "async-timeout",
     "aiocache",
     "aiofiles",
@@ -49,8 +49,8 @@ dependencies = [
     "tiktoken",
     "mcp==1.26.0",
 
-    "openai",
-    "anthropic",
+    "openai==2.43.0",
+    "anthropic==0.111.0",
     "google-genai==1.62.0",
 
     "langchain==1.2.9",

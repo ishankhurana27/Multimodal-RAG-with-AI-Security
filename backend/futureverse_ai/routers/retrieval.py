@@ -1540,6 +1540,7 @@ def save_docs_to_vector_db(
         result = VECTOR_DB_CLIENT.query(
             collection_name=collection_name,
             filter={"hash": metadata["hash"]},
+            limit=10000,  # fetch all matching chunks (avoid Weaviate's 25 default cap)
         )
         if result is not None and result.ids and len(result.ids) > 0:
             existing_doc_ids = result.ids[0]

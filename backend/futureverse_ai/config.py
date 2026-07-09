@@ -2784,7 +2784,7 @@ RAG_HYBRID_BM25_WEIGHT = PersistentConfig(
 ENABLE_RAG_HYBRID_SEARCH = PersistentConfig(
     "ENABLE_RAG_HYBRID_SEARCH",
     "rag.enable_hybrid_search",
-    os.environ.get("ENABLE_RAG_HYBRID_SEARCH", "").lower() == "true",
+    os.environ.get("ENABLE_RAG_HYBRID_SEARCH", "True").lower() == "true"  # default ON; falls back to vector-only on failure (Phase 3),
 )
 
 ENABLE_NEO4J = PersistentConfig(
@@ -3120,10 +3120,22 @@ Only include attributes that are actually present on the tag. Only list sources 
 </context>
 """
 
+# Strict grounding (Phase 3): when RAG_STRICT_GROUNDING=true the model is told NOT to
+# answer from its own knowledge if the context lacks the answer (closed-book mode).
+# Derived from the base template via .replace() so the two never drift.
+DEFAULT_RAG_TEMPLATE_STRICT = DEFAULT_RAG_TEMPLATE.replace(
+    "- If the answer isn't present in the context but you possess the knowledge, explain this to the user and provide the answer using your own understanding.",
+    "- If the answer is not present in the context, clearly state it is not available in the loaded study material. Do NOT answer from your own knowledge.",
+)
+_RAG_STRICT_GROUNDING = os.environ.get("RAG_STRICT_GROUNDING", "false").lower() == "true"
+
 RAG_TEMPLATE = PersistentConfig(
     "RAG_TEMPLATE",
     "rag.template",
-    os.environ.get("RAG_TEMPLATE", DEFAULT_RAG_TEMPLATE),
+    os.environ.get(
+        "RAG_TEMPLATE",
+        DEFAULT_RAG_TEMPLATE_STRICT if _RAG_STRICT_GROUNDING else DEFAULT_RAG_TEMPLATE,
+    ),
 )
 
 RAG_OPENAI_API_BASE_URL = PersistentConfig(
