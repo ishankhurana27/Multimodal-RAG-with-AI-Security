@@ -229,6 +229,13 @@ class ChunkingAgent:
         t0       = time.monotonic()
         warnings = []
 
+        # ── Foundation paragraph-level strategy (Infinity Foundation manual) ────
+        # When active, bypass markdown pre-split + fixed-size splitting entirely:
+        # the Foundation chunker does its own content-type routing, heading
+        # absorption, and 2–6 sentence paragraph boundaries (manual Ch. 2–3).
+        if getattr(request.app.state.config, "CHUNKING_STRATEGY", "") == "foundation":
+            return self._foundation_split(docs, t0)
+
         # ── Markdown header pre-split ──────────────────────────────────────────
         if request.app.state.config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER:
             markdown_splitter = MarkdownHeaderTextSplitter(
@@ -390,6 +397,62 @@ class ChunkingAgent:
             flush=True,
         )
         return child_docs
+
+    def _foundation_split(self, docs: list[Document], t0: float) -> AgentResult:
+        """
+        Foundation paragraph-level chunking (manual Ch. 2–3).
+
+        One Document per paragraph chunk, holding VERBATIM text (no [CONTEXT]
+        prefix — Ch. 1.2 zero-hallucination guarantee) plus Foundation metadata.
+        LLM attribute tagging (Pass 1/2) is NOT run here: it needs a committed
+        Q-matrix vocabulary and is a separate stage. Non-servable classes
+        (exercises, headers, footnotes, margins, enrichment boxes) are excluded
+        from the index. The chunks flow unchanged into embedding + Weaviate.
+        """
+        from futureverse_ai.retrieval.foundation.pipeline import build_drafts
+        from futureverse_ai.retrieval.foundation.schema import ContentType as _CT
+
+        warnings: list[str] = []
+        out: list[Document] = []
+        servable = {_CT.BODY_TEXT, _CT.SIDEBAR_RECALL, _CT.TABLE_ROW, _CT.DIAGRAM_CAPTION}
+
+        for doc in docs:
+            base_meta = dict(doc.metadata)
+            for d in build_drafts(doc.page_content):
+                if d.content_type not in servable:
+                    continue   # enrichment / non-servable → not indexed (Ch. 3.3)
+                md = dict(base_meta)
+                md.update({
+                    "raw_text":            d.verbatim_text,    # BM25 + display source
+                    "has_context":         False,
+                    "content_type":        d.content_type.value,
+                    "paragraph_sequence":  d.paragraph_sequence,
+                    "position_in_section": d.paragraph_sequence,
+                    "token_count":         max(1, len(d.verbatim_text) // 4),
+                    "sentence_count":      d.sentence_count,
+                    "chunk_id":            str(uuid.uuid4()),
+                })
+                if d.sub_section_title:
+                    md["breadcrumb"] = d.sub_section_title
+                    md["header_1"]   = d.sub_section_title
+                if d.context_note:
+                    md["context_summary"] = d.context_note
+                out.append(Document(page_content=d.verbatim_text, metadata=md))
+
+        if not out:
+            warnings.append("Foundation chunker produced no servable chunks")
+        print(
+            f"  [2/4] Foundation split → {len(out)} paragraph chunks"
+            f"  (content-type aware, verbatim, 2-6 sentences)",
+            flush=True,
+        )
+        return AgentResult(
+            agent="ChunkingAgent",
+            ok=bool(out),
+            data=out,
+            elapsed_s=time.monotonic() - t0,
+            warnings=warnings,
+        )
 
 
 class ChunkingChecker:
@@ -1505,6 +1568,9 @@ def run_ingestion_pipeline(
             _ctx_available = False
 
         _ctx_enabled = request.app.state.config.ENABLE_CONTEXTUAL_CHUNKING
+        if getattr(request.app.state.config, "CHUNKING_STRATEGY", "") == "foundation":
+            # Verbatim guarantee (manual Ch. 1.2): never prepend a [CONTEXT] block.
+            _ctx_enabled = False
 
         pre_ctx    = list(docs)
         ctx_result = ctx_agent.run(

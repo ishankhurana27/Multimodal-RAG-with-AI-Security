@@ -85,7 +85,8 @@ msoffcrypto-tool==6.0.0
 nltk==3.9.2
 Markdown==3.10.1
 pypandoc==1.16.2
-pandas==3.0.0
+#pandas==3.0.0
+pandas==2.2.3
 openpyxl==3.1.5
 pyxlsb==1.0.10
 xlrd==2.0.2
@@ -95,7 +96,8 @@ sentencepiece
 soundfile==0.13.1
 
 pillow==12.1.0
-opencv-python-headless==4.13.0.92
+#opencv-python-headless==4.13.0.92
+opencv-python-headless==4.9.0.80
 rapidocr-onnxruntime==1.4.4
 rank-bm25==0.2.2
 
@@ -168,3 +170,6 @@ opentelemetry-instrumentation-aiohttp-client==0.60b1
 neo4j>=5.0,<7
 python-igraph
 leidenalg
+
+
+numpy==1.26.4

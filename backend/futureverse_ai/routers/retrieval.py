@@ -1662,8 +1662,13 @@ def process_file(
                 # Check if the file has already been processed and save the content
                 # Usage: /knowledge/{id}/file/add, /knowledge/{id}/file/update
 
+                # Explicit high limit: without it the vector DB applies its
+                # default query limit (Weaviate = 25), which silently truncates
+                # large files to the first 25 chunks when added to a KB.
                 result = VECTOR_DB_CLIENT.query(
-                    collection_name=f"file-{file.id}", filter={"file_id": file.id}
+                    collection_name=f"file-{file.id}",
+                    filter={"file_id": file.id},
+                    limit=10000,
                 )
 
                 if result is not None and len(result.ids[0]) > 0:

@@ -773,7 +773,7 @@
 									class="dark:bg-gray-900 w-fit pr-8 rounded-sm px-2 text-xs bg-transparent outline-hidden text-right"
 									bind:value={RAGConfig.CHUNKING_STRATEGY}
 								>
-									<!-- <option value="paragraph">{$i18n.t('Paragraph')} ({$i18n.t('Recommended')})</option> -->
+									<option value="foundation">{$i18n.t('Foundation (Paragraph)')} ({$i18n.t('Recommended')})</option>
 									<option value="hierarchical">{$i18n.t('Hierarchical')} + {$i18n.t('Contextual')}</option>
 									<option value="fixed">{$i18n.t('Fixed Size')} + {$i18n.t('Contextual')}</option>
 								</select>
@@ -803,7 +803,7 @@
 							</div>
 						{/if} -->
 
-						{#if RAGConfig.CHUNKING_STRATEGY !== 'paragraph'}
+						{#if RAGConfig.CHUNKING_STRATEGY !== 'paragraph' && RAGConfig.CHUNKING_STRATEGY !== 'foundation'}
 							<div class="  mb-2.5 flex w-full justify-between">
 								<div class=" self-center text-xs font-medium">{$i18n.t('Text Splitter')}</div>
 								<div class="flex items-center relative">
