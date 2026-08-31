@@ -23,7 +23,7 @@ def app_config():
         CHUNK_MIN_SIZE_TARGET=0,
         ENABLE_CONTEXTUAL_CHUNKING=False,
         ENABLE_KEYWORD_EXTRACTION=True,
-        KEYWORD_EXTRACTION_METHOD="regex",
+        KEYWORD_EXTRACTION_METHOD="llama3",
         RAG_EMBEDDING_ENGINE="ollama",
         RAG_EMBEDDING_MODEL="nomic-embed-text",
         RAG_EMBEDDING_BATCH_SIZE=8,

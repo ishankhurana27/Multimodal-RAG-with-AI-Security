@@ -407,6 +407,45 @@ class WeaviateClient(VectorDBBase):
             ],
         )
 
+
+    # ── vector shape: named space vs legacy unnamed ───────────────────────
+    # _create_collection prefers Configure.Vectors.self_provided(), which on
+    # weaviate-client >= 4.16 creates a NAMED vector space called "default".
+    # A flat list handed to batch.add_object() does not go into that space —
+    # it lands in the legacy unnamed slot, so the object stores a vector that
+    # no nearVector query can reach: dense search returns zero objects with
+    # no error, and hybrid retrieval silently degrades to keyword-only.
+    # (Observed on a 1427-object knowledge base: 1897 BM25 hits, 0 dense.)
+    # Collections created before that change use the legacy slot and need a
+    # flat list. So the shape is chosen per collection from its own config.
+    def _vector_space(self, sane_collection_name: str):
+        """Name of the single named vector space, or None for legacy."""
+        cache = getattr(self, "_vec_space_cache", None)
+        if cache is None:
+            cache = self._vec_space_cache = {}
+        if sane_collection_name in cache:
+            return cache[sane_collection_name]
+        space = None
+        try:
+            cfg = self.client.collections.get(sane_collection_name).config.get()
+            named = getattr(cfg, "vector_config", None) or getattr(
+                cfg, "vectorizer_config", None)
+            if isinstance(named, dict) and named:
+                space = "default" if "default" in named else sorted(named)[0]
+        except Exception:
+            space = None
+        cache[sane_collection_name] = space
+        return space
+
+    def _vector_arg(self, sane_collection_name: str, vector):
+        """Vector in the shape this collection actually stores."""
+        if vector is None:
+            return None
+        space = self._vector_space(sane_collection_name)
+        if space and not isinstance(vector, dict):
+            return {space: vector}
+        return vector
+
     def insert(self, collection_name: str, items: List[VectorItem]) -> None:
         import logging as _logging
         _log = _logging.getLogger(__name__)
@@ -430,7 +469,9 @@ class WeaviateClient(VectorDBBase):
                     properties.update(clean_metadata)
 
                 batch.add_object(
-                    properties=properties, uuid=item_uuid, vector=item["vector"]
+                    properties=properties, uuid=item_uuid,
+                    vector=self._vector_arg(
+                        sane_collection_name, item["vector"]),
                 )
 
         # Surface batch-level errors that Weaviate silently swallows by default
@@ -476,7 +517,9 @@ class WeaviateClient(VectorDBBase):
                     properties.update(clean_metadata)
 
                 batch.add_object(
-                    properties=properties, uuid=item_uuid, vector=item["vector"]
+                    properties=properties, uuid=item_uuid,
+                    vector=self._vector_arg(
+                        sane_collection_name, item["vector"]),
                 )
 
         failed = getattr(batch, "failed_objects", []) or []

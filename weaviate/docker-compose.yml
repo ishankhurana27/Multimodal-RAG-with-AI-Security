@@ -1,6 +1,12 @@
+# Project name — the group Docker Desktop shows. Kept here rather than
+# only in weaviate/.env, which is gitignored: without this the rename
+# would be local to one machine. COMPOSE_PROJECT_NAME still overrides it.
+name: futureverse
+
 services:
   weaviate:
     image: cr.weaviate.io/semitechnologies/weaviate:1.27.0
+    container_name: futureverse-ai
     restart: on-failure:0
     ports:
       - "8085:8080"
@@ -16,4 +22,15 @@ services:
       - weaviate_data:/var/lib/weaviate
 
 volumes:
+  # The project rename would otherwise point this at a NEW, EMPTY volume
+  # (futureverse_weaviate_data) and Weaviate would come up with no data while
+  # the real 1427+395 objects sat stranded in the old one. Pinning the
+  # existing volume by its full name keeps the same storage across the
+  # rename — nothing is copied or migrated.
+  #
+  # external:true also means `docker compose down -v` can no longer delete
+  # it, and that a missing volume fails loudly instead of silently starting
+  # empty.
   weaviate_data:
+    external: true
+    name: weaviate_weaviate_data

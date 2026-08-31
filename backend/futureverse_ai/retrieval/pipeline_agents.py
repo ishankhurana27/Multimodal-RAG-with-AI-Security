@@ -3,7 +3,6 @@ Ingestion pipeline agents — Steps 3–7 of the SHC-CE pipeline.
 
 Each agent owns exactly one stage:
   ChunkingAgent             — Step 3: SHC-CE hierarchical / character / token chunking
-  KeywordAgent              — Step 5: BM25 keyword extraction (runs before enrichment)
   ContextualEnrichmentAgent — Step 4: LLM [CONTEXT]/[CONTENT] prefix via Ollama
   EmbeddingAgent            — Step 6: bge-m3 GPU vector generation
   IndexingAgent             — Step 7: Weaviate HNSW + BM25 dual-index insert
@@ -23,7 +22,7 @@ import os
 import re
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -35,7 +34,6 @@ from langchain_text_splitters import (
 )
 
 log = logging.getLogger(__name__)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Agent result envelope
@@ -65,136 +63,413 @@ def _log_stage(agent_result: AgentResult, check_result: AgentResult) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KEYWORD EXTRACTION HELPERS
-# Moved from routers/retrieval.py — only used by KeywordAgent.
-# Logic is byte-for-byte identical to the original inline functions.
+# KEYWORD EXTRACTION — REASONING (LLM) PATH
+#
+# Purpose: populate metadata["keywords"], the field Weaviate's BM25 index
+# searches. Unlike a lexical extractor, which can only echo phrases already
+# present verbatim, the model reasons about what a student would type and
+# emits STANDARD expansions and abbreviations of what it finds ("DPSP" <->
+# "Directive Principles of State Policy", "H2O" <-> "water"). That is what
+# lets a BM25 query hit a chunk that spells the concept the other way, and
+# it is why this path exists at all.
+#
+# Deliberately NOT here (removed on purpose, do not reintroduce):
+#   • the lexical R0-R14 rule set — replaced by the model
+#   • the local JSON keyword cache — extraction runs fresh each ingest
+#   • domain vocabulary packs / news-to-topic mapping
+# On any model failure the chunk is left unlabelled and a warning is logged:
+# there is no lexical fallback to silently degrade into.
+#
+#   ENABLE_KEYWORD_EXTRACTION   master switch (default on)
+#   KEYWORD_EXTRACTION_METHOD   "llama3"/"llm" (default) — anything else
+#                               disables extraction for that run
+#   KEYWORD_EXTRACTION_MODEL    default qwen3:14b-q8_0
+#   KEYWORD_EXTRACTION_THINK    reasoning on/off (default on)
+#   KEYWORD_INDEX_ALL_BLOCKS    index exercise/reference blocks too
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _extract_chunk_keywords_regex(text: str, metadata: dict) -> list:
-    """Regex/NER-lite keyword extraction — fast, no model required."""
-    words = text.split()
-    keyword_parts = []
-    i = 0
-    while i < len(words):
-        clean = re.sub(r"[^a-zA-Z0-9'-]", "", words[i])
-        if clean and clean[0].isupper() and len(clean) > 3:
-            phrase = [clean]
-            j = i + 1
-            while j < min(i + 4, len(words)):
-                nxt = re.sub(r"[^a-zA-Z0-9'-]", "", words[j])
-                if nxt and nxt[0].isupper() and len(nxt) > 2:
-                    phrase.append(nxt)
-                    j += 1
-                else:
-                    break
-            keyword_parts.append(" ".join(phrase))
-            i = j
-        else:
-            i += 1
-    return keyword_parts
+# Non-prose blocks: bibliographies, exercise sets and bare image descriptions
+# are not chapter vocabulary. Their text stays in raw_text (BM25 still reaches
+# it); it simply never becomes an index term.
+_BLOCK_EXCLUDE_RE = re.compile(
+    r"\b(?:exercises?|references?|bibliograph\w*|further\s+reading|suggested\s+"
+    r"additional\s+activities|answer\s+key|glossary|index)\b", re.I)
+# A citation line: "BADEN-POWELL, B. 1892. The Land Systems of British India."
+_CITATION_RE = re.compile(
+    r"^[A-Z][A-Z'’\-]{2,}(?:,\s*[A-Z]\.?)+|"
+    r"\b(?:Clarendon|Oxford University|Cambridge University|Penguin|Routledge|"
+    r"Macmillan|Sage|Orient|Longman)\b|"
+    r"^\s*\d+\.\s+[A-Z][A-Z'’\-]{2,},")
 
 
-def _extract_chunk_keywords_keybert(text: str) -> list:
-    """KeyBERT-based semantic keyword extraction using sentence-transformers locally."""
-    try:
-        import pathlib
-        from keybert import KeyBERT
-        from sentence_transformers import SentenceTransformer
-        _kb = getattr(_extract_chunk_keywords_keybert, "_model", None)
-        if _kb is None:
-            _cache = (
-                pathlib.Path.home()
-                / ".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots"
-            )
-            _snapshots = sorted(_cache.iterdir()) if _cache.exists() else []
-            _model_path = str(_snapshots[0]) if _snapshots else "all-MiniLM-L6-v2"
-            st = SentenceTransformer(_model_path, local_files_only=True)
-            _kb = KeyBERT(model=st)
-            _extract_chunk_keywords_keybert._model = _kb
-        results = _kb.extract_keywords(
-            text,
-            keyphrase_ngram_range=(1, 3),
-            stop_words="english",
-            top_n=10,
-            use_mmr=True,
-            diversity=0.5,
-        )
-        return [kw for kw, _ in results]
-    except Exception as e:
-        log.warning("KeyBERT extraction failed, falling back to regex: %s", e)
-        return []
+def block_type(text: str, metadata: dict = None) -> str:
+    """R12: classify a chunk so non-prose blocks can be kept out of the index."""
+    metadata = metadata or {}
+    head = " ".join(str(metadata.get(k, "")) for k in
+                    ("breadcrumb", "header_1", "header_2", "header_3", "name"))
+    first = "\n".join((text or "").splitlines()[:3])
+    if _BLOCK_EXCLUDE_RE.search(head) or _BLOCK_EXCLUDE_RE.search(first):
+        return "references" if re.search(r"referen|bibliograph", head + first, re.I) \
+            else "exercise"
+    body = (text or "").strip()
+    if body.startswith("[Photograph") or body.startswith("[Image") or body.startswith("[Map"):
+        return "image_description"
+    return "content"
 
 
-def _extract_chunk_keywords_llama3(text: str, ollama_url: str) -> list:
-    """Llama-3 keyword extraction via Ollama — high quality, ~1s per chunk."""
+# ── R1. scaffolding regions stripped before any extraction ───────────────────
+_MD_DECOR = re.compile(r"^[\s>#*_•·▲△◆■\-–—+|]+")            # leading decoration
+_META_LINE_RE = re.compile(r"^[*_\s]*[a-z_]+\s*:\s", re.I)   # "*pedagogical_feature: ...*"
+_SCAFFOLD_HEAD_RE = re.compile(
+    r"^(?:A\s+)?(?:CHECK\s+YOUR\s+UNDERSTANDING|WORKED\s+EXAMPLE|NOTE\s+ON\b"
+    r"|LIVE\s+DATA|TRAP\b|NOTE\b|READING\b|REQUIRES\b|NUMBERED\s+FIGURE"
+    r"|DIAGRAM\b|RENDERED\b|ANSWER\s*[::]|DISTRACTOR\s+DIAGNOSIS"
+    r"|SOURCE\s*[::]|PEDAGOGICAL)",
+    re.I,
+)
+_CODE_RE = re.compile(r"\[[A-Z][A-Z0-9._\-]{3,}\]")          # [MC.OPPCOST.ZERO_IF_NO_PRICE]
+_DOK_RE = re.compile(r"·?\s*dok[_\s]*level?\s*[:·]?\s*\d\b|·?\s*DOK\s*\d\b", re.I)
+_MCQ_OPTS_RE = re.compile(r"\((?:[a-d])\)\s")
+
+
+def strip_scaffolding(text: str) -> str:
+    """R1: remove exam-prep furniture so it can never become a keyword."""
+    text = _CODE_RE.sub(" ", text or "")
+    text = _DOK_RE.sub(" ", text)
+    out = []
+    for line in text.splitlines():
+        bare = _MD_DECOR.sub("", line).strip()
+        if not bare:
+            continue
+        if _META_LINE_RE.match(bare) and len(bare) < 400:
+            continue                                   # metadata annotation line
+        if _SCAFFOLD_HEAD_RE.match(bare):
+            continue
+        if len(_MCQ_OPTS_RE.findall(bare)) >= 2:
+            continue                                   # an MCQ option line
+        if _CITATION_RE.search(bare):
+            continue                                   # bibliography entry
+        alpha = [c for c in bare if c.isalpha()]
+        if (len(bare) < 90 and len(alpha) >= 6
+                and sum(c.isupper() for c in alpha) / len(alpha) > 0.85):
+            continue        # ALL-CAPS heading ("1.3 AGRICULTURAL SECTOR"): its
+                            # words are not acronyms, and raw_text already has it
+        out.append(bare)
+    return "\n".join(out)
+
+
+def _acronym_like(term: str) -> bool:
+    core = term.replace("-", "").replace(".", "")
+    return (2 <= len(core) <= 8 and core.isalnum()
+            and sum(c.isupper() for c in core) >= max(2, len(core) - 2))
+
+
+def _extract_chunk_keywords_llama3(
+    text: str,
+    ollama_url: str,
+    model: str = "qwen3:14b-q8_0",
+    think: bool = True,
+) -> list:
+    """Reasoning-based keyword extraction via a local Ollama model.
+
+    Purpose: the chat-RAG BM25 index ONLY. Question generation deliberately
+    ignores this field (the qgen router queries raw_text/text), so nothing
+    here can change generated questions.
+
+    Unlike the regex/keybert modes, which can only pick phrases that appear
+    verbatim, the model reasons about what a student would search and adds
+    STANDARD expansions and abbreviations of the terms it extracts
+    ("DPSP" <-> "Directive Principles of State Policy", "H2O" <-> "water") —
+    expansion of conventional forms, never invention. That is what makes a
+    BM25 query hit a chunk that spells the concept the other way.
+
+    think=True lets hybrid models (Qwen3 family) reason before answering
+    (~5-15s per chunk on a 14B); think=False is ~3x faster and keeps most of
+    the quality. A 400 from an Ollama build that rejects the think field gets
+    one retry without it; any inline <think> block is stripped before
+    parsing. Returns [] on any failure — the dispatcher then falls back to
+    regex, so ingestion never blocks on this.
+    """
     import json as _json
+    import re as _re
+    import urllib.error
     import urllib.request
 
     prompt = (
-        "Extract 5 to 10 high-value keywords or key phrases from the following text. "
-        "Focus on named entities, proper nouns, technical terms, and domain-specific concepts. "
-        "Return only a comma-separated list of keywords, nothing else.\n\nText:\n"
-        + text[:1500]
+        "You are building the keyword index for one passage of exam-preparation "
+        "study material. A keyword (BM25) search engine will use it alongside a "
+        "separate semantic search, so your job is to make this passage findable "
+        "by a student who types a question in their own words.\n\n"
+        "Think first: what is this passage actually about, and what would a "
+        "student type to find it — including short forms, symbols and the names "
+        "of anything specific?\n\n"
+        "Then output ONE flat list combining four kinds of item:\n\n"
+        "1. SPECIFIC NAMES — every named thing the passage is really about: "
+        "people, institutions, laws and acts with their year, court cases, "
+        "schemes, reports, treaties, places, organisms, elements, theories, "
+        "models. Copy them as the passage writes them.\n"
+        "2. NUMBERED / SYMBOLIC REFERENCES — identifiers exactly as written "
+        "(Article 356, Section 144, Schedule VII, 42nd Amendment), and the "
+        "formulae, equations, units or dated figures the passage turns on "
+        "(H2O, NaCl, F = ma, FY26, 2011-12 base year).\n"
+        "3. STANDARD ALIASES — for every item above and every technical term you "
+        "list, add the other conventional form as its own item, in BOTH "
+        "directions:\n"
+        '   - abbreviation <-> full form: "DPSP" and "Directive Principles of '
+        'State Policy"; "GDP" and "Gross Domestic Product"\n'
+        '   - symbol or formula <-> name: "H2O" and "water"; "NaCl" and '
+        '"sodium chloride"\n'
+        '   - exam nickname <-> formal reference: "President\'s Rule" and '
+        '"Article 356"\n'
+        "   Only forms that are standard and unambiguous in this subject. If you "
+        "are unsure a form is standard, leave it out.\n"
+        "4. CONCEPT TERMS — three to six short noun phrases naming the ideas the "
+        "passage teaches (opportunity cost, judicial review, oxidation state, "
+        "monsoon onset), in the subject's own vocabulary.\n\n"
+        "Rules:\n"
+        "- Every item must appear in the passage OR be a standard alias of "
+        "something that does. Never invent a name, number, formula or expansion "
+        "— an invented alias is worse than a missing one.\n"
+        "- Ignore the study material's furniture: practice questions, answer "
+        "keys, distractor codes, 'check your understanding', worked examples, "
+        "trap boxes, figure and table captions, section cross-references, page "
+        "or chapter numbering. Index the subject matter only.\n"
+        "- Noun phrases only — no sentences, no verb clauses, no question "
+        "phrasings. Each item under 8 words.\n"
+        "- No duplicates or near-duplicates of the same string.\n"
+        "- 10 to 18 items.\n\n"
+        'Reply with a JSON object only: {"keywords": ["...", "..."]}\n\n'
+        "Passage:\n" + text[:3000]
     )
-    payload = _json.dumps({
-        "model": "llama3",
-        "prompt": prompt,
+    # num_predict must cover the THINKING tokens too — with a hard-thinking
+    # chunk, a small budget gets fully consumed inside the think phase and the
+    # content arrives empty (seen live as: json "Expecting value ... (char 0)").
+    req_body = {
+        "model": model,
         "stream": False,
-        "options": {"temperature": 0, "num_predict": 100},
-    }).encode()
-    try:
-        req = urllib.request.Request(
-            f"{ollama_url.rstrip('/')}/api/generate",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = _json.loads(resp.read())
-        raw = data.get("response", "").strip()
-        keywords = [kw.strip() for kw in raw.split(",") if kw.strip()]
-        return keywords[:15]
-    except Exception as e:
-        log.warning("Llama-3 keyword extraction failed, falling back to regex: %s", e)
-        return []
+        "format": "json",
+        "options": {"temperature": 0, "num_predict": 4096},
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if think is not None:
+        req_body["think"] = bool(think)
+
+    for attempt in (0, 1, 2):
+        try:
+            req = urllib.request.Request(
+                f"{ollama_url.rstrip('/')}/api/chat",
+                data=_json.dumps(req_body).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                data = _json.loads(resp.read())
+            raw = ((data.get("message") or {}).get("content") or "").strip()
+            raw = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.S)
+            raw = _re.sub(r"```(?:json)?", "", raw).strip()
+            start = raw.find("{")
+            if start >= 0:
+                raw = raw[start : raw.rfind("}") + 1]
+            else:
+                raw = ""
+            if not raw:
+                raise ValueError(
+                    f"empty content (done_reason={data.get('done_reason')!r} — "
+                    "thinking likely consumed num_predict)"
+                )
+            kws = _json.loads(raw).get("keywords") or []
+            kws = [str(k).strip() for k in kws if str(k).strip()]
+            # 15: the full field budget. Structural anchors are no longer
+              # appended, so nothing needs to be held back for them.
+            return kws[:15]
+        except urllib.error.HTTPError as e:
+            if e.code == 400 and "think" in req_body and attempt < 2:
+                del req_body["think"]
+                continue
+            log.warning("LLM keyword extraction failed (HTTP %s) — chunk left "
+                        "unlabelled", e.code)
+            return []
+        except Exception as e:
+            # Empty or unparseable content: most often the think phase ate the
+            # whole token budget on this chunk. Retry once with thinking OFF —
+            # still LLM extraction, far better than dropping to regex.
+            if req_body.get("think") and attempt < 2:
+                log.info("LLM keyword extraction retrying think=false: %s", e)
+                req_body["think"] = False
+                continue
+            log.warning("LLM keyword extraction failed — chunk left unlabelled "
+            "(no lexical fallback by design): %s", e)
+            return []
+    return []
+
+
+# Breadcrumb paths and source filenames are not search terms: BM25 tokenises
+# them, so every chunk of a chapter would carry the chapter title's tokens and
+# the engine would lose the ability to tell one section from another.
+_ANCHOR_TERM_RE = re.compile(
+    r"(?:^|\s)>\s|\s>\s|\.(?:md|markdown|pdf|txt|docx?|html?)\s*$", re.I)
+
+
+def _sanitize_keywords(kw: str) -> str:
+    if not kw:
+        return kw
+    kept = [t.strip() for t in kw.split(",")
+            if t.strip() and not _ANCHOR_TERM_RE.search(t.strip())]
+    return ", ".join(kept)
 
 
 def _extract_chunk_keywords(
     text: str,
     metadata: dict,
-    method: str = "regex",
     ollama_url: str = "",
-) -> str:
-    """Dispatch keyword extraction to the configured method; return comma-separated string."""
-    if method == "keybert":
-        keyword_parts = _extract_chunk_keywords_keybert(text)
-        if not keyword_parts:
-            keyword_parts = _extract_chunk_keywords_regex(text, metadata)
-    elif method == "llama3":
-        keyword_parts = _extract_chunk_keywords_llama3(
-            text, ollama_url or "http://localhost:11434"
-        )
-        if not keyword_parts:
-            keyword_parts = _extract_chunk_keywords_regex(text, metadata)
-    else:
-        keyword_parts = _extract_chunk_keywords_regex(text, metadata)
+    model: str = "qwen3:14b-q8_0",
+    think: bool = True,
+) -> tuple:
+    """(comma-separated keywords, used_llm).
 
-    # Always append structural metadata fields for precise BM25 anchoring
-    for field_name in ("breadcrumb", "chapter", "subject", "class_level", "name"):
-        val = metadata.get(field_name)
-        if val and isinstance(val, str) and len(val) > 2:
-            keyword_parts.append(val)
+    Scaffolding is stripped once before the model sees the text, so exam-prep
+    furniture (question blocks, answer keys, distractor codes, figure
+    captions) can never become an index term — and the prompt stays shorter.
+    """
+    clean = strip_scaffolding(text)
+    parts = _extract_chunk_keywords_llama3(
+        clean, ollama_url or "http://localhost:11434", model=model, think=think)
+    used_llm = bool(parts)
 
-    # Deduplicate preserving order, cap at 15
     seen: set = set()
     unique: list = []
-    for kw in keyword_parts:
+    for kw in parts:
         kl = kw.lower()
-        if kl not in seen and len(kw) > 3:
+        # A bare length filter silently dropped every 2-3 letter acronym —
+        # GDP, GVA, PPP, CPI, PIL, SC, ST — which are among the highest-value
+        # BM25 tokens in exam material. Keep anything acronym-shaped.
+        if kl not in seen and (len(kw) > 3 or _acronym_like(kw)):
             seen.add(kl)
             unique.append(kw)
+    return _sanitize_keywords(", ".join(unique[:15])), used_llm
 
-    return ", ".join(unique[:15])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5 — KEYWORD AGENT + CHECKER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class KeywordAgent:
+    """
+    Step 5 — BM25 keyword generation (reasoning path).
+
+    Populates doc.metadata["keywords"] for Weaviate's BM25 inverted index.
+    Runs BEFORE contextual enrichment so the keywords field is available when
+    the enricher annotates key_entities.
+    """
+
+    def run(
+        self,
+        docs: list[Document],
+        ollama_url: str,
+        enabled: bool = True,
+        model: str = "qwen3:14b-q8_0",
+        think: bool = True,
+    ) -> AgentResult:
+        t0       = time.monotonic()
+        warnings = []
+
+        if not enabled:
+            print("  [KW] Keyword extraction  SKIPPED (disabled)", flush=True)
+            return AgentResult(agent="KeywordAgent", ok=True, data=docs,
+                               elapsed_s=time.monotonic() - t0)
+
+        index_all = os.environ.get("KEYWORD_INDEX_ALL_BLOCKS", "0").strip().lower() in (
+            "1", "true", "yes", "on")
+        kw_count = llm_calls = skipped_blocks = failed = 0
+        for doc in docs:
+            raw = doc.metadata.get("raw_text") or doc.page_content
+
+            # A chunk re-ingested from the vector store can arrive with
+            # keywords=None. Normalise it so no consumer has to defend
+            # against a null.
+            if doc.metadata.get("keywords") is None and "keywords" in doc.metadata:
+                doc.metadata["keywords"] = ""
+
+            btype = block_type(raw, doc.metadata)
+            doc.metadata["kw_block_type"] = btype
+            if btype != "content" and not index_all:
+                doc.metadata["keywords"] = ""
+                skipped_blocks += 1
+                continue
+
+            kw, used_llm = _extract_chunk_keywords(
+                raw, doc.metadata, ollama_url=ollama_url, model=model, think=think)
+            if used_llm:
+                llm_calls += 1
+            elif btype == "content":
+                # No lexical fallback by design: an unlabelled chunk is
+                # visible (raw_text is still BM25-searchable), a silently
+                # degraded one is not.
+                failed += 1
+
+            doc.metadata["keywords"] = kw or ""
+            if kw:
+                kw_count += 1
+
+        print(
+            f"  [KW] Keyword extraction (llm)"
+            f" → {kw_count}/{len(docs)} chunks labelled"
+            f" ({llm_calls} llm calls"
+            + (f", {skipped_blocks} non-content block(s) skipped" if skipped_blocks else "")
+            + (f", {failed} FAILED" if failed else "")
+            + ")",
+            flush=True,
+        )
+        if failed:
+            warnings.append(
+                f"{failed} content chunk(s) got no keywords — the extraction "
+                f"model did not answer; those chunks are BM25-searchable via "
+                f"raw_text only")
+        if kw_count == 0:
+            warnings.append("No keywords extracted — BM25 coverage will be degraded")
+
+        return AgentResult(agent="KeywordAgent", ok=True, data=docs,
+                           elapsed_s=time.monotonic() - t0, warnings=warnings)
+
+
+class KeywordChecker:
+    """
+    Validates KeywordAgent output: chunk count unchanged, page_content not
+    mutated, and every CONTENT chunk carries a keywords value.
+    """
+
+    def check(self, input_docs: list[Document], result: AgentResult) -> AgentResult:
+        t0       = time.monotonic()
+        warnings = list(result.warnings)
+        docs     = result.data or []
+
+        if len(docs) != len(input_docs):
+            return AgentResult(
+                agent="KeywordChecker", ok=False, data=result.data,
+                elapsed_s=time.monotonic() - t0,
+                warnings=[f"Chunk count changed: {len(input_docs)} → {len(docs)}"])
+
+        # `or ""` is load-bearing: a chunk re-ingested from the vector store
+        # arrives with keywords=None whenever the property was never written.
+        # An empty field on a non-content block is the intended outcome, so it
+        # is reported separately rather than counted as a defect.
+        bad_kw = [
+            i for i, d in enumerate(docs)
+            if "keywords" in d.metadata
+            and not (d.metadata.get("keywords") or "").strip()
+            and d.metadata.get("kw_block_type", "content") == "content"
+        ]
+        skipped = sum(1 for d in docs
+                      if d.metadata.get("kw_block_type", "content") != "content")
+        if bad_kw:
+            warnings.append(
+                f"{len(bad_kw)} content chunk(s) have no keywords "
+                f"(first indices: {bad_kw[:5]})")
+        print(f"  [KW] check: {len(docs) - len(bad_kw) - skipped} labelled, "
+              f"{len(bad_kw)} unlabelled, {skipped} skipped", flush=True)
+
+        return AgentResult(agent="KeywordChecker", ok=True, data=result.data,
+                           elapsed_s=time.monotonic() - t0, warnings=warnings)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -464,15 +739,15 @@ class ChunkingAgent:
 
     def _heading_split(self, docs: list[Document], t0: float) -> AgentResult:
         """
-        H3-section chunking — one chunk per '###' section, and ONLY '###'.
+        Heading-section chunking — one chunk per '#', '##' or '###' section.
 
-        Each '###' heading starts a chunk that holds everything until the next
-        heading of level <= 3 (the next '###', '##' or '#'), including its
-        '####'+ sub-parts, images and body — verbatim. '#' and '##' headings do
-        NOT create chunks: they only update the breadcrumb context. Any content
-        that is not under a '###' (chapter intros, '##'-only sections and their
-        text) is therefore NOT indexed. So a chapter with nine '###' produces
-        exactly nine chunks.
+        Every heading of level 1-3 starts a chunk that holds everything until
+        the next heading of level <= 3, including its '####'+ sub-parts, images
+        and body — verbatim. The breadcrumb tracks the running h1 > h2 > h3
+        context. Text before the first heading (chapter preamble) is emitted as
+        its own chunk, so no content is dropped. Sections that are only a
+        heading line with no body (e.g. a '#' immediately followed by '##')
+        are skipped.
 
         Sections are emitted whole: no fixed-size splitting and no markdown
         pre-split. Chunk Size / Overlap / Text Splitter settings do not apply.
@@ -486,41 +761,37 @@ class ChunkingAgent:
         for doc in docs:
             base_meta = dict(doc.metadata)
             h1 = h2 = h3 = ""            # running heading context (for breadcrumb)
-            cur_crumb = None             # (h1, h2, h3) of the OPEN ### section, else None
+            cur_crumb = ("", "", "")     # (h1, h2, h3) of the OPEN section
             cur_lines: list[str] = []
             sections: list[tuple] = []   # (h1, h2, h3, text)
 
             def _close():
-                # Emit the currently-open ### section, if any.
-                if cur_crumb is not None:
-                    text = "\n".join(cur_lines).strip()
-                    if text:
-                        sections.append((*cur_crumb, text))
+                # Emit the currently-open section if it has body content
+                # (not just its own heading line).
+                text = "\n".join(cur_lines).strip()
+                body_lines = [l for l in cur_lines if not heading_re.match(l)]
+                if text and any(l.strip() for l in body_lines):
+                    sections.append((*cur_crumb, text))
 
             for line in doc.page_content.splitlines():
                 m = heading_re.match(line)
                 level = len(m.group(1)) if m else 0
-                if m and level == 3:
-                    # New '###' section — close the previous one, open this one.
+                if m and level <= 3:
+                    # New '#'/'##'/'###' section — close previous, open this one.
                     _close()
-                    h3 = m.group(2).strip()
-                    cur_crumb = (h1, h2, h3)
-                    cur_lines = [line]
-                elif m and level <= 2:
-                    # '#' / '##' — update context only; end any open ### section
-                    # and drop the loose (non-###) content that follows.
-                    _close()
-                    cur_crumb = None
-                    cur_lines = []
                     title = m.group(2).strip()
                     if level == 1:
                         h1, h2, h3 = title, "", ""
-                    else:
+                    elif level == 2:
                         h2, h3 = title, ""
+                    else:
+                        h3 = title
+                    cur_crumb = (h1, h2, h3)
+                    cur_lines = [line]
                 else:
-                    # Body / image / '####'+ heading — keep only inside a ### section.
-                    if cur_crumb is not None:
-                        cur_lines.append(line)
+                    # Body / image / '####'+ heading — belongs to the open
+                    # section (or to the preamble before the first heading).
+                    cur_lines.append(line)
             _close()
 
             for seq, (c1, c2, c3, text) in enumerate(sections):
@@ -542,10 +813,10 @@ class ChunkingAgent:
                 out.append(Document(page_content=text, metadata=md))
 
         if not out:
-            warnings.append("H3 chunker produced no ### sections")
+            warnings.append("Heading chunker produced no sections")
         print(
             f"  [2/4] Heading split    → {len(out)} sections"
-            f"  (one chunk per ### section, verbatim; #/## not chunked)",
+            f"  (one chunk per #/##/### section, verbatim; preamble kept)",
             flush=True,
         )
         return AgentResult(
@@ -617,132 +888,6 @@ class ChunkingChecker:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — KEYWORD AGENT + CHECKER
-# (runs before contextual enrichment — same order as the existing inline code)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class KeywordAgent:
-    """
-    Step 5 — BM25 Keyword Generation.
-
-    Extracts entity-anchored keywords from each chunk's raw text via the
-    configured method (regex / keybert / llama3). Populates
-    doc.metadata["keywords"] for Weaviate's native BM25 inverted index.
-
-    Execution order: runs BEFORE contextual enrichment so that the keywords
-    field is available when the enricher annotates key_entities. This
-    preserves the exact ordering of the original inline code.
-    """
-
-    def run(
-        self,
-        docs: list[Document],
-        method: str,
-        ollama_url: str,
-        enabled: bool = True,
-    ) -> AgentResult:
-        t0       = time.monotonic()
-        warnings = []
-
-        if not enabled:
-            print("  [KW] Keyword extraction  SKIPPED (disabled)", flush=True)
-            return AgentResult(
-                agent="KeywordAgent",
-                ok=True,
-                data=docs,
-                elapsed_s=time.monotonic() - t0,
-            )
-
-        kw_count = 0
-        for doc in docs:
-            raw = doc.metadata.get("raw_text") or doc.page_content
-            kw  = _extract_chunk_keywords(
-                raw, doc.metadata, method=method, ollama_url=ollama_url
-            )
-            if kw:
-                doc.metadata["keywords"] = kw
-                kw_count += 1
-
-        print(
-            f"  [KW] Keyword extraction ({method})"
-            f" → {kw_count}/{len(docs)} chunks labelled",
-            flush=True,
-        )
-        if kw_count == 0:
-            warnings.append("No keywords extracted — BM25 coverage will be degraded")
-
-        return AgentResult(
-            agent="KeywordAgent",
-            ok=True,
-            data=docs,
-            elapsed_s=time.monotonic() - t0,
-            warnings=warnings,
-        )
-
-
-class KeywordChecker:
-    """
-    Validates KeywordAgent output.
-
-    Checks:
-      - Chunk count is unchanged (keyword extraction must not alter list length)
-      - page_content was not mutated (keywords go in metadata only)
-      - No chunks have a keywords field that is an empty string
-    """
-
-    def check(
-        self,
-        input_docs: list[Document],
-        result: AgentResult,
-    ) -> AgentResult:
-        t0       = time.monotonic()
-        warnings = list(result.warnings)
-        ok       = True
-        docs     = result.data or []
-
-        if len(docs) != len(input_docs):
-            return AgentResult(
-                agent="KeywordChecker",
-                ok=False,
-                data=result.data,
-                elapsed_s=time.monotonic() - t0,
-                warnings=[
-                    f"Chunk count changed: {len(input_docs)} → {len(docs)}"
-                ],
-            )
-
-        bad_kw = [
-            i for i, d in enumerate(docs)
-            if "keywords" in d.metadata and not d.metadata["keywords"].strip()
-        ]
-        if bad_kw:
-            warnings.append(f"{len(bad_kw)} chunks have empty keywords field")
-
-        corrupted = [
-            i for i in range(len(docs))
-            if docs[i].page_content != input_docs[i].page_content
-        ]
-        if corrupted:
-            ok = False
-            warnings.append(
-                f"page_content mutated in {len(corrupted)} chunks during keyword extraction"
-            )
-
-        print(
-            f"  [CHECK] KeywordChecker"
-            f" → {len(docs)} chunks, {len(bad_kw)} empty-kw"
-            f"  {'OK' if ok else 'FAIL'}",
-            flush=True,
-        )
-        return AgentResult(
-            agent="KeywordChecker",
-            ok=ok,
-            data=result.data,
-            elapsed_s=time.monotonic() - t0,
-            warnings=warnings,
-        )
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 4 — CONTEXTUAL ENRICHMENT AGENT + CHECKER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1585,7 +1730,7 @@ def run_ingestion_pipeline(
     Execution order:
       Step 3    ChunkingAgent              → ChunkingChecker
       Step 5    KeywordAgent               → KeywordChecker        (before enrichment)
-      Step 4    ContextualEnrichment       → EnrichmentChecker     (after keywords)
+      Step 4    ContextualEnrichment       → EnrichmentChecker
                 Build texts + metadatas
       Step 5.5  ChunkDeduplicationAgent    → ChunkDeduplicationChecker
                   ↳ SHA-256 stamp on raw_text; two-pass dedup:
@@ -1644,13 +1789,38 @@ def run_ingestion_pipeline(
         if not docs:
             raise ValueError(ERROR_MESSAGES.EMPTY_CONTENT)
 
-        # ── Step 5: Keyword Generation ────────────────────────────────────────
-        _kw_enabled = getattr(request.app.state.config, "ENABLE_KEYWORD_EXTRACTION", True)
-        _kw_method  = getattr(request.app.state.config, "KEYWORD_EXTRACTION_METHOD", "regex")
+        # Ollama endpoint for the enrichment model (previously set by the
+        # keyword stage, which no longer exists).
         _ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
+        # ── Step 5: Keyword Generation (reasoning path) ───────────────────────
+        _kw_enabled = getattr(request.app.state.config,
+                              "ENABLE_KEYWORD_EXTRACTION", True)
+        # The config attr is deliberately not consulted for the method: a
+        # PersistentConfig may hold a stale value from first boot, and this
+        # knob must never silently downgrade extraction quality. Any value
+        # other than llama3/llm disables extraction rather than falling back.
+        _kw_method = (os.environ.get("KEYWORD_EXTRACTION_METHOD")
+                      or getattr(request.app.state.config,
+                                 "KEYWORD_EXTRACTION_METHOD", "llama3")
+                      or "llama3").strip().lower()
+        if _kw_method not in ("llama3", "llm"):
+            log.warning("KEYWORD_EXTRACTION_METHOD=%r is not a reasoning "
+                        "method — keyword extraction disabled for this run",
+                        _kw_method)
+            _kw_enabled = False
+        _kw_model = getattr(
+            request.app.state.config, "KEYWORD_EXTRACTION_MODEL",
+            os.environ.get("KEYWORD_EXTRACTION_MODEL", "qwen3:14b-q8_0"),
+        )
+        _kw_think = str(getattr(
+            request.app.state.config, "KEYWORD_EXTRACTION_THINK",
+            os.environ.get("KEYWORD_EXTRACTION_THINK", "true"),
+        )).strip().lower() not in ("false", "0", "off", "no")
+
         pre_kw    = list(docs)
-        kw_result = keyword_agent.run(docs, _kw_method, _ollama_url, enabled=_kw_enabled)
+        kw_result = keyword_agent.run(docs, _ollama_url, enabled=_kw_enabled,
+                                      model=_kw_model, think=_kw_think)
         kw_check  = keyword_checker.check(pre_kw, kw_result)
         _log_stage(kw_result, kw_check)
         if not kw_check.ok:

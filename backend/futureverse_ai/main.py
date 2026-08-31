@@ -107,6 +107,7 @@ from futureverse_ai.routers import (
     utils,
     scim,
     aku,
+    questions,
 )
 
 from futureverse_ai.routers.retrieval import (
@@ -1544,6 +1545,32 @@ app.include_router(folders.router, prefix="/api/v1/folders", tags=["folders"])
 app.include_router(groups.router, prefix="/api/v1/groups", tags=["groups"])
 app.include_router(files.router, prefix="/api/v1/files", tags=["files"])
 app.include_router(aku.router, prefix="/api/v1/aku", tags=["aku"])
+app.include_router(
+    questions.router, prefix="/api/v1/questions", tags=["questions"]
+)
+
+# ── RAG configuration banner ──────────────────────────────────────────────────
+# ENABLE_PERSISTENT_CONFIG=False means admin-panel settings silently revert to
+# env/defaults on every restart. Print the values that actually govern chunking
+# and retrieval so a wrong setting is visible at startup instead of being
+# discovered later from bad results.
+try:
+    _rag_cfg = {
+        "CHUNKING_STRATEGY": getattr(app.state.config, "CHUNKING_STRATEGY", "(unset)"),
+        "CHUNK_SIZE": getattr(app.state.config, "CHUNK_SIZE", "?"),
+        "CHUNK_OVERLAP": getattr(app.state.config, "CHUNK_OVERLAP", "?"),
+        "ENABLE_RAG_HYBRID_SEARCH": getattr(app.state.config, "ENABLE_RAG_HYBRID_SEARCH", "?"),
+        "RAG_TOP_K": getattr(app.state.config, "RAG_TOP_K", "?"),
+        "RAG_EMBEDDING_MODEL": getattr(app.state.config, "RAG_EMBEDDING_MODEL", "?"),
+        "RAG_RERANKING_MODEL": getattr(app.state.config, "RAG_RERANKING_MODEL", "") or "(none)",
+        "ENABLE_CONTEXTUAL_CHUNKING": getattr(app.state.config, "ENABLE_CONTEXTUAL_CHUNKING", "?"),
+        "VECTOR_DB": VECTOR_DB if "VECTOR_DB" in dir() else os.environ.get("VECTOR_DB", "?"),
+        "ENABLE_PERSISTENT_CONFIG": os.environ.get("ENABLE_PERSISTENT_CONFIG", "(default)"),
+    }
+    log.info("[RAG CONFIG] " + " | ".join(f"{k}={v}" for k, v in _rag_cfg.items()))
+    print("  RAG CONFIG: " + " | ".join(f"{k}={v}" for k, v in _rag_cfg.items()), flush=True)
+except Exception as _cfg_e:  # never block startup on a banner
+    log.debug("RAG config banner failed: %s", _cfg_e)
 app.include_router(functions.router, prefix="/api/v1/functions", tags=["functions"])
 app.include_router(
     evaluations.router, prefix="/api/v1/evaluations", tags=["evaluations"]
