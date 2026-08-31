@@ -2975,19 +2975,26 @@ ENABLE_CONTEXTUAL_CHUNKING = PersistentConfig(
     os.environ.get("ENABLE_CONTEXTUAL_CHUNKING", "true").lower() == "true",
 )
 
+
+
+# ── Keyword extraction (BM25 index field) ─────────────────────────────────────
+# Reasoning-based extraction: a local Ollama model reads each chunk and emits
+# the terms a student would search, including standard expansions and
+# abbreviations ("DPSP" <-> "Directive Principles of State Policy"). There is
+# no lexical fallback — a failed extraction leaves the chunk unlabelled rather
+# than silently degrading index quality.
 ENABLE_KEYWORD_EXTRACTION = PersistentConfig(
     "ENABLE_KEYWORD_EXTRACTION",
     "rag.enable_keyword_extraction",
     os.environ.get("ENABLE_KEYWORD_EXTRACTION", "true").lower() == "true",
 )
 
-# Keyword extraction method: "regex" (default), "keybert", "llama3"
-# "keybert" uses sentence-transformers locally (no API needed)
-# "llama3" calls Ollama with llama3 model — requires Ollama running
+# "llama3" / "llm" — the reasoning path (default). Any other value disables
+# extraction for that run instead of falling back to a weaker method.
 KEYWORD_EXTRACTION_METHOD = PersistentConfig(
     "KEYWORD_EXTRACTION_METHOD",
     "rag.keyword_extraction_method",
-    os.environ.get("KEYWORD_EXTRACTION_METHOD", "regex"),
+    os.environ.get("KEYWORD_EXTRACTION_METHOD", "llama3"),
 )
 
 # ── Embedding Deduplication ───────────────────────────────────────────────────

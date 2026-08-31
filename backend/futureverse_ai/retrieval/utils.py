@@ -444,7 +444,8 @@ async def query_doc_with_hybrid_search(
             pre_computed_embedding=pre_computed_embedding,
         )
 
-        # Dynamic weighting — boost BM25 for short queries OR specific entity names
+        # Dynamic weighting — boost BM25 for short queries OR specific
+        # entity names (capitalised terms).
         words = query.split()
         has_entity = any(w[0].isupper() for w in words if len(w) > 3)
         if len(words) <= 4 or has_entity:
